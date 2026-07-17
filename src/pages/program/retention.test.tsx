@@ -146,7 +146,7 @@ describe('photo comparability (spec §5.3)', () => {
   });
 });
 
-/* ── Program page ─────────────────────────────────────────────────────── */
+/* ── Program page ──────────────────────────────────────────────────────── */
 
 describe('Program page', () => {
   it('renders weeks, free-tier locks on days 4–28, honesty card and disclaimer', async () => {
@@ -177,7 +177,7 @@ describe('Program page', () => {
   });
 });
 
-/* ── Check-in flow ────────────────────────────────────────────────────── */
+/* ── Check-in flow ─────────────────────────────────────────────────────── */
 
 describe('Check-in flow', () => {
   async function runToSummary(irritation: boolean) {
@@ -221,7 +221,7 @@ describe('Check-in flow', () => {
   });
 });
 
-/* ── Progress page ────────────────────────────────────────────────────── */
+/* ── Progress page ─────────────────────────────────────────────────────── */
 
 describe('Progress page', () => {
   it('renders stats, heatmap, badges, photo invitation and milestones', async () => {
