@@ -1,0 +1,25 @@
+{
+  "name": "LumaFace — AI Facial Care Coach",
+  "short_name": "LumaFace",
+  "description": "A warm, evidence-honest facial care ritual: skincare basics, gentle movement, massage and posture care. Never judged, never scored.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#FCFCF8",
+  "theme_color": "#FCFCF8",
+  "icons": [
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
