@@ -7,12 +7,13 @@
  */
 
 import { useEffect, useState } from 'react';
-import { useLocation } from 'react-router';
+import { Link, useLocation } from 'react-router';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
   Bandage,
   Check,
   ChevronDown,
+  ChevronRight,
   CircleAlert,
   Droplets,
   Eye,
@@ -22,6 +23,7 @@ import {
   Mail,
   NotebookPen,
   PauseCircle,
+  Receipt,
   Syringe,
   Thermometer,
   TriangleAlert,
@@ -282,6 +284,22 @@ export default function Help() {
           ))}
         </section>
       </div>
+
+      {/* ── Section 4.5 — Billing & support row (M2) ── */}
+      <motion.section initial={{ opacity: 0, y: 24 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true, amount: 0.2 }} transition={{ duration: 0.5, ease: EASE }} className="px-5 mt-8">
+        <Link to="/support" aria-label="Billing, refunds and support">
+          <Card tappable className="flex items-center gap-3.5 p-4">
+            <span className="inline-flex size-10 shrink-0 items-center justify-center rounded-full bg-rose-tint text-rose-deep" aria-hidden="true">
+              <Receipt size={19} strokeWidth={1.75} />
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block text-body font-bold text-ink">Billing, refunds &amp; support</span>
+              <span className="block text-caption text-ink-2 mt-0.5">The 48-hour refund promise, canceling, and your tickets</span>
+            </span>
+            <ChevronRight size={17} className="shrink-0 text-ink-3" aria-hidden="true" />
+          </Card>
+        </Link>
+      </motion.section>
 
       {/* ── Section 5 — Contact card ── */}
       <motion.section initial={{ opacity: 0, y: 24 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true, amount: 0.2 }} transition={{ duration: 0.5, ease: EASE }} className="px-5 mt-8">
