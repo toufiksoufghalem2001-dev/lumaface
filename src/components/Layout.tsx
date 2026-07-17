@@ -13,7 +13,7 @@ import TopBrandBar from '@/components/TopBrandBar';
 import BottomTabBar from '@/components/BottomTabBar';
 
 /** Immersive flows — no brand bar, no tab bar (§2). */
-const IMMERSIVE_ROUTES = ['/onboarding', '/activity/:id/session', '/activity/:id/done', '/checkin', '/paywall'];
+const IMMERSIVE_ROUTES = ['/onboarding', '/activity/:id/session', '/activity/:id/done', '/checkin', '/paywall', '/auth', '/auth/callback', '/billing/success', '/billing/cancel'];
 
 export default function Layout() {
   const { pathname } = useLocation();

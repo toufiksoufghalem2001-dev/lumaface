@@ -14,6 +14,11 @@ import Coach from '@/pages/Coach'
 import Paywall from '@/pages/Paywall'
 import Profile from '@/pages/Profile'
 import Help from '@/pages/Help'
+import Auth from '@/pages/Auth'
+import AuthCallback from '@/pages/AuthCallback'
+import BillingSuccess from '@/pages/BillingSuccess'
+import BillingCancel from '@/pages/BillingCancel'
+import Support from '@/pages/Support'
 
 /**
  * LumaFace routes (design.md §8.8). Nested-route pattern: Layout renders
@@ -38,6 +43,11 @@ export default function App() {
         <Route path="paywall" element={<Paywall />} />
         <Route path="profile" element={<Profile />} />
         <Route path="help" element={<Help />} />
+        <Route path="auth" element={<Auth />} />
+        <Route path="auth/callback" element={<AuthCallback />} />
+        <Route path="billing/success" element={<BillingSuccess />} />
+        <Route path="billing/cancel" element={<BillingCancel />} />
+        <Route path="support" element={<Support />} />
         <Route path="*" element={<Home />} />
       </Route>
     </Routes>

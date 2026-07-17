@@ -11,7 +11,7 @@
 
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { Camera, ChartNoAxesColumn, FolderLock, Info, MessageCircleHeart, type LucideIcon } from 'lucide-react';
+import { Camera, ChartNoAxesColumn, CloudUpload, FolderLock, Info, MessageCircleHeart, type LucideIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import Sheet from '@/components/Sheet';
 
@@ -44,6 +44,15 @@ export const CONSENT_COPY = {
     description: 'Keep your local coach preview threads on this device.',
     explainer: 'The coach answers from an expert-approved library. Threads stay on this device only when you opt in.',
     legal: 'Coach threads are stored only in this device’s local storage. They are never used to train models and never leave the device in this build.',
+  },
+  sync: {
+    icon: CloudUpload,
+    title: 'Sync & back up my data',
+    description: 'Keep a safe account backup of your plan, progress and settings. Off = everything stays only on this device.',
+    explainer:
+      'When on, your profile, safety answers, plan, sessions, check-ins and settings sync to your LumaFace account so you can restore them or pick up on another device. Turn it off anytime — uploading stops immediately.',
+    legal:
+      'While enabled, the data listed above is transmitted to our servers, linked only to your account and protected by row-level security. Photos are never uploaded; coach threads sync only if coach chat history is also enabled. Revoking stops all future uploads; previously synced data is erased when you use Delete all my data.',
   },
 } as const;
 
