@@ -9,11 +9,35 @@
  */
 
 import { Outlet, matchPath, useLocation } from 'react-router';
+import { X } from 'lucide-react';
 import TopBrandBar from '@/components/TopBrandBar';
 import BottomTabBar from '@/components/BottomTabBar';
+import { useApp } from '@/lib/store';
 
 /** Immersive flows — no brand bar, no tab bar (§2). */
 const IMMERSIVE_ROUTES = ['/onboarding', '/activity/:id/session', '/activity/:id/done', '/checkin', '/paywall', '/auth', '/auth/callback', '/billing/success', '/billing/cancel'];
+
+/** Honest notice when a local save fails (e.g. device storage full). */
+function PersistenceWarning() {
+  const { persistenceWarning, dismissPersistenceWarning } = useApp();
+  if (!persistenceWarning) return null;
+  return (
+    <div role="alert" className="absolute inset-x-4 top-3 z-40 flex items-start gap-2.5 rounded-tile bg-card border border-hairline shadow-pop p-3.5">
+      <p className="flex-1 text-caption text-ink">
+        This device couldn't save your latest change — storage may be full. Everything saved so far is safe; freeing up
+        space lets new changes stick.
+      </p>
+      <button
+        type="button"
+        onClick={dismissPersistenceWarning}
+        aria-label="Dismiss storage warning"
+        className="inline-flex size-8 shrink-0 items-center justify-center rounded-full text-ink-3"
+      >
+        <X size={15} aria-hidden="true" />
+      </button>
+    </div>
+  );
+}
 
 export default function Layout() {
   const { pathname } = useLocation();
@@ -33,6 +57,7 @@ export default function Layout() {
       {/* Phone column — Sheets portal into this frame */}
       <div id="lf-phone-frame" className="relative w-full max-w-[430px] bg-cream min-h-[100dvh] sm:min-h-0 sm:h-[min(900px,calc(100dvh-64px))] sm:rounded-[44px] sm:border-[10px] sm:border-ink-frame sm:shadow-device flex flex-col overflow-hidden">
         <div data-lf-scroll className="lf-scroll relative flex-1 overflow-y-auto overflow-x-hidden">
+          <PersistenceWarning />
           {!immersive && <TopBrandBar />}
           <Outlet />
         </div>

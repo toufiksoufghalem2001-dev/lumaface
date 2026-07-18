@@ -10,7 +10,13 @@
 
 ## M2 additions
 - Stripe/APP_BASE_URL secrets pending (CEO dashboard task) — billing runs in "opening soon" mode until configured.
-- Account deletion removes all user rows via RLS but the auth.users record itself remains (needs a service-side delete function or dashboard action — M3).
+- ~~Account deletion removes all user rows via RLS but the auth.users record itself remains~~ — resolved: the `delete-account` Edge Function now deletes the auth user (CASCADE removes all rows); honest failure toasts when unreachable.
 - Apple/Google OAuth not configured (needs CEO store/dev accounts); email-only auth for pilot.
 - Sync conflicts use last-write-wins per entity; multi-device simultaneous edits of the same plan day can clobber (acceptable at pilot scale).
 - package-lock.json intentionally not pushed to GitHub (regenerable); npm install required after clone.
+
+## M3 additions
+- ~~Storage quota failures not surfaced (localStorage try/catch only logged)~~ — resolved: failed saves now surface a dismissible in-app warning banner (persistence.test.tsx).
+- Capture-quality thresholds (lighting/blur/framing) are conservative estimates — need real-device calibration on iPhone Safari/PWA + mid-range Android.
+- Camera permission-denial and interrupted-capture flows need real-device QA.
+- IndexedDB photo store needs native filesystem adaptation when packaging with Capacitor.

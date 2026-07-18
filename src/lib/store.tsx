@@ -214,6 +214,10 @@ export interface AppContextValue {
   currentDay: number;
   /** derived: activityIds completed today */
   todayDoneIds: string[];
+  /** honest persistence state: set when a local save fails (e.g. storage full) */
+  persistenceWarning: string | null;
+  /** dismiss the persistence warning banner */
+  dismissPersistenceWarning: () => void;
 
   /* ── actions ── */
   /** finish onboarding: evaluate safety, build plan, mark onboarded */
@@ -289,11 +293,26 @@ function load<T>(key: string, fallback: T): T {
   }
 }
 
+/* ── persistence-failure surfacing (KNOWN-ISSUES: quota must not fail silently) ── */
+
+type PersistErrorHandler = (key: string) => void;
+let persistErrorHandler: PersistErrorHandler | null = null;
+
+/** The provider registers one handler; failures are surfaced, never silent. */
+export function registerPersistErrorHandler(handler: PersistErrorHandler | null): void {
+  persistErrorHandler = handler;
+}
+
 function save(key: string, value: unknown): void {
   try {
     localStorage.setItem(key, JSON.stringify(value));
   } catch (e) {
     console.warn(`[LumaFace] could not persist ${key}`, e);
+    try {
+      persistErrorHandler?.(key);
+    } catch {
+      /* surfacing must never break the app */
+    }
   }
 }
 
@@ -375,6 +394,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [pro, setProState] = useState<ProState>(() => load(K.pro, DEFAULT_PRO));
   const [coachThreads, setCoachThreads] = useState<CoachThread[]>(() => load(K.coachThreads, []));
   const [auth, setAuthState] = useState<AuthState>({ status: 'signed-out' });
+  const [persistenceWarning, setPersistenceWarning] = useState<string | null>(null);
+
+  /* ── quota failures surface honestly instead of failing silently ── */
+  useEffect(() => {
+    registerPersistErrorHandler((key) => setPersistenceWarning(key));
+    return () => registerPersistErrorHandler(null);
+  }, []);
+
+  const dismissPersistenceWarning = useCallback(() => setPersistenceWarning(null), []);
 
   /* ── persistence effects ── */
   useEffect(() => save(K.onboarded, onboarded), [onboarded]);
@@ -766,6 +794,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     safetyEval,
     currentDay,
     todayDoneIds,
+    persistenceWarning,
+    dismissPersistenceWarning,
     completeOnboarding,
     skipOnboarding,
     setProfile,
