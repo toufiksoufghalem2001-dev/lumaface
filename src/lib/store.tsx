@@ -60,6 +60,7 @@ import {
   type UserProfile,
 } from '@/lib/plan';
 import { ACTIVITY_BY_ID } from '@/data/activities';
+import { clearLocalPhotos, deleteLocalPhoto, migrateLegacyPhotos, saveLocalPhoto } from '@/lib/photoStore';
 
 /* ═══════════════════════════ Exported types ═══════════════════════════ */
 
@@ -270,12 +271,14 @@ const K = {
   progress: 'lf_progress',
   checkins: 'lf_checkins',
   consents: 'lf_consents',
+  /** Legacy only: migrated to IndexedDB on first launch after M3. */
   photos: 'lf_photos',
   pro: 'lf_pro',
   coachThreads: 'lf_coach_threads',
 } as const;
 
 const ALL_KEYS = Object.values(K);
+const EXTRA_LOCAL_KEYS = ['lf_onboarding_draft', 'lf_checkin_draft'] as const;
 
 function load<T>(key: string, fallback: T): T {
   try {
@@ -368,7 +371,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [progress, setProgress] = useState<ProgressState>(() => load(K.progress, DEFAULT_PROGRESS));
   const [checkIns, setCheckIns] = useState<CheckInRecord[]>(() => load(K.checkins, []));
   const [consents, setConsents] = useState<Consents>(() => ({ ...DEFAULT_CONSENTS, ...load(K.consents, DEFAULT_CONSENTS) }));
-  const [photos, setPhotos] = useState<Capture[]>(() => load(K.photos, []));
+  const [photos, setPhotos] = useState<Capture[]>([]);
   const [pro, setProState] = useState<ProState>(() => load(K.pro, DEFAULT_PRO));
   const [coachThreads, setCoachThreads] = useState<CoachThread[]>(() => load(K.coachThreads, []));
   const [auth, setAuthState] = useState<AuthState>({ status: 'signed-out' });
@@ -382,7 +385,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => save(K.progress, progress), [progress]);
   useEffect(() => save(K.checkins, checkIns), [checkIns]);
   useEffect(() => save(K.consents, consents), [consents]);
-  useEffect(() => save(K.photos, photos), [photos]);
+  // Photos are hydrated from IndexedDB and persisted per mutation. Keeping them
+  // out of localStorage avoids synchronous multi-megabyte writes.
+  useEffect(() => {
+    let active = true;
+    void migrateLegacyPhotos(localStorage.getItem(K.photos))
+      .then((captures) => {
+        if (!active) return;
+        setPhotos(captures);
+        localStorage.removeItem(K.photos);
+      })
+      .catch((error) => console.warn('[LumaFace] could not load local photos', error));
+    return () => { active = false; };
+  }, []);
   useEffect(() => save(K.pro, pro), [pro]);
   useEffect(() => save(K.coachThreads, coachThreads), [coachThreads]);
 
@@ -652,12 +667,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
       createdAt: new Date().toISOString(),
     };
     setPhotos((prev) => [...prev, capture]);
+    void saveLocalPhoto(capture).catch((error) => {
+      console.warn('[LumaFace] could not persist photo', error);
+      setPhotos((prev) => prev.filter((item) => item.captureId !== capture.captureId));
+    });
     pushCaptureMeta(capture); // metadata only; gated on photoSave + sync inside sync.ts
     return capture;
   }, []);
 
   const deletePhoto = useCallback((captureId: string) => {
     setPhotos((prev) => prev.filter((p) => p.captureId !== captureId));
+    void deleteLocalPhoto(captureId).catch((error) => console.warn('[LumaFace] could not delete photo', error));
     removeCaptureMeta(captureId);
   }, []);
 
@@ -673,6 +693,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const exportData = useCallback(() => {
+    void (async () => {
     const dump: Record<string, unknown> = {};
     for (const key of ALL_KEYS) {
       try {
@@ -681,6 +702,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         dump[key] = null;
       }
     }
+    // Photos are local-only and now live in IndexedDB. Include them in an
+    // explicit user export without reintroducing localStorage persistence.
+    dump[K.photos] = photos;
     const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), app: 'LumaFace', data: dump }, null, 2)], {
       type: 'application/json',
     });
@@ -692,7 +716,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-  }, []);
+    })();
+  }, [photos]);
 
   const setAuth = useCallback((next: AuthState) => {
     setAuthState(next);
@@ -704,8 +729,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setAuthState({ status: 'signed-out' });
   }, []);
 
-  const deleteAllData = useCallback(() => {
+  const deleteAllData = useCallback(async () => {
     for (const key of ALL_KEYS) localStorage.removeItem(key);
+    for (const key of EXTRA_LOCAL_KEYS) localStorage.removeItem(key);
+    try {
+      await clearLocalPhotos();
+    } catch (error) {
+      console.warn('[LumaFace] could not clear photo storage', error);
+    }
     clearSyncLocalState(); // lf_outbox + lf_sync_meta
     window.location.reload();
   }, []);
