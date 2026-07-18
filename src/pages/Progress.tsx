@@ -24,6 +24,7 @@ import {
   FolderLock,
   Gem,
   Info,
+  AlertTriangle,
   Lock,
   Sparkles,
   Sun,
@@ -44,7 +45,7 @@ import Sheet from '@/components/Sheet';
 import { Card, LFButton } from '@/components/ui';
 import { EmptyPhotos } from '@/components/illos';
 import PetalConfetti from '@/components/PetalConfetti';
-import { capturesComparable, processPhotoFile } from '@/pages/progress/photo';
+import { assessCaptureQuality, capturesComparable, processPhotoFile, type ProcessedPhoto } from '@/pages/progress/photo';
 import QualityChips from '@/pages/progress/QualityChips';
 import { useCountUp } from '@/pages/progress/useCountUp';
 import {
@@ -453,6 +454,7 @@ function PhotoDiarySection() {
   const fileRef = useRef<HTMLInputElement>(null);
   const [processing, setProcessing] = useState(false);
   const [lastSaved, setLastSaved] = useState<{ capture: Capture; comparable: boolean } | null>(null);
+  const [pendingPhoto, setPendingPhoto] = useState<ProcessedPhoto | null>(null);
   const [fullView, setFullView] = useState<Capture | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [celebrate, setCelebrate] = useState(false);
@@ -480,8 +482,13 @@ function PhotoDiarySection() {
   const handleFile = async (file: File) => {
     setProcessing(true);
     try {
-      const { dataUrl, quality } = await processPhotoFile(file);
-      const capture = addPhoto(dataUrl, quality);
+      const processed = await processPhotoFile(file);
+      const assessment = assessCaptureQuality(processed.quality);
+      if (!assessment.acceptable) {
+        setPendingPhoto(processed);
+        return;
+      }
+      const capture = addPhoto(processed.dataUrl, processed.quality);
       setLastSaved({ capture, comparable: baseline ? capturesComparable(baseline, capture) : true });
     } catch {
       /* unreadable file — quietly stay put */
@@ -533,6 +540,38 @@ function PhotoDiarySection() {
       />
 
       <PetalConfetti active={celebrate} count={8} accentColor={COLORS.gold} onDone={() => setCelebrate(false)} />
+
+      <Sheet open={pendingPhoto !== null} onClose={() => setPendingPhoto(null)} ariaLabel="Capture quality check">
+        {pendingPhoto && (
+          <div className="p-5">
+            <div className="flex items-start gap-3">
+              <span className="mt-0.5 grid size-9 shrink-0 place-items-center rounded-full bg-cream-2 text-ink-2">
+                <AlertTriangle size={18} aria-hidden="true" />
+              </span>
+              <div>
+                <h3 className="font-display text-title text-ink">Try one more capture?</h3>
+                <p className="mt-1 text-caption text-ink-2">
+                  The light, focus, or framing may make this photo difficult to compare fairly later. Nothing about your appearance was analyzed.
+                </p>
+              </div>
+            </div>
+            <QualityChips quality={pendingPhoto.quality} className="mt-4" />
+            <div className="mt-5 grid gap-2">
+              <LFButton onClick={() => { setPendingPhoto(null); openPicker(); }}>Retake photo</LFButton>
+              <LFButton
+                variant="secondary"
+                onClick={() => {
+                  const capture = addPhoto(pendingPhoto.dataUrl, pendingPhoto.quality);
+                  setLastSaved({ capture, comparable: baseline ? capturesComparable(baseline, capture) : true });
+                  setPendingPhoto(null);
+                }}
+              >
+                Save anyway
+              </LFButton>
+            </div>
+          </div>
+        )}
+      </Sheet>
 
       {hidden ? (
         /* "Focus on habits" collapsed state (§4 / spec §10.4) */
