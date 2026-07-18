@@ -22,6 +22,25 @@ export interface ProcessedPhoto {
   quality: CaptureQuality;
 }
 
+export interface CaptureQualityAssessment {
+  acceptable: boolean;
+  reasons: Array<'too-dark' | 'too-bright' | 'too-blurry' | 'poor-framing'>;
+}
+
+/**
+ * M3 capture gate. This evaluates capture conditions only, never facial
+ * appearance. A failed gate should invite a retake while still allowing the
+ * user to keep the photo explicitly.
+ */
+export function assessCaptureQuality(q: CaptureQuality): CaptureQualityAssessment {
+  const reasons: CaptureQualityAssessment['reasons'] = [];
+  if (q.lighting < 0.28) reasons.push('too-dark');
+  if (q.lighting > 0.92) reasons.push('too-bright');
+  if (q.blur > 0.62) reasons.push('too-blurry');
+  if (q.pose < 0.7) reasons.push('poor-framing');
+  return { acceptable: reasons.length === 0, reasons };
+}
+
 /** Read a captured file, downscale to ≤720px, estimate capture conditions. */
 export async function processPhotoFile(file: File): Promise<ProcessedPhoto> {
   const dataUrl = await readAsDataUrl(file);
@@ -41,7 +60,7 @@ export async function processPhotoFile(file: File): Promise<ProcessedPhoto> {
   }
   ctx.drawImage(img, 0, 0, w, h);
 
-  const quality = estimateQuality(ctx, w, h, file.size);
+  const quality = estimateQuality(ctx, w, h);
   const out = canvas.toDataURL('image/jpeg', 0.82);
   return { dataUrl: out, quality };
 }
@@ -82,7 +101,7 @@ function loadImage(src: string): Promise<HTMLImageElement> {
  * proxies — never anything about the face. `pose` stays a gentle constant
  * (real framing guidance ships with the M1 camera coach).
  */
-function estimateQuality(ctx: CanvasRenderingContext2D, w: number, h: number, fileBytes: number): CaptureQuality {
+function estimateQuality(ctx: CanvasRenderingContext2D, w: number, h: number): CaptureQuality {
   const sample = 32;
   const sx = Math.max(1, Math.floor(w / sample));
   const sy = Math.max(1, Math.floor(h / sample));
@@ -109,7 +128,9 @@ function estimateQuality(ctx: CanvasRenderingContext2D, w: number, h: number, fi
   // mean neighbour gradient ≈ sharpness proxy; map to a 0..1 "blur" score
   const sharp = count > 1 ? gradSum / (count - 1) : 20;
   const blur = Math.round(Math.min(Math.max(1 - sharp / 22, 0), 1) * 100) / 100;
-  // deterministic per-image jitter so repeated captures feel measured, not random
-  const pose = Math.round((0.86 + ((fileBytes % 97) / 97) * 0.1) * 100) / 100;
+  // Honest framing proxy: portrait/square captures are suitable for the fixed
+  // comparison frame. This does not detect or score a face.
+  const aspect = w / h;
+  const pose = aspect >= 0.55 && aspect <= 1.05 ? 0.9 : 0.55;
   return { lighting, blur, pose };
 }
