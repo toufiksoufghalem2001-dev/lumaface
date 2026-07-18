@@ -12,7 +12,7 @@
 - Stripe/APP_BASE_URL secrets pending (CEO dashboard task) — billing runs in "opening soon" mode until configured.
 - ~~Account deletion removes all user rows via RLS but the auth.users record itself remains~~ — resolved: the `delete-account` Edge Function now deletes the auth user (CASCADE removes all rows); honest failure toasts when unreachable.
 - Apple/Google OAuth not configured (needs CEO store/dev accounts); email-only auth for pilot.
-- Sync conflicts use last-write-wins per entity; multi-device simultaneous edits of the same plan day can clobber (acceptable at pilot scale).
+- Sync conflicts: collections union-merge losslessly (session logs, check-ins, comfort log, coach messages). The plan entity itself remains last-write-wins — a plan is a coherent generated document, so field-level mixing would risk inconsistency with safety rules; documented, acceptable at pilot scale.
 - package-lock.json intentionally not pushed to GitHub (regenerable); npm install required after clone.
 
 ## M3 additions
