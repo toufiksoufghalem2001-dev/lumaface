@@ -12,9 +12,35 @@
  *   lf_onboarded · lf_profile · lf_safety · lf_inventory · lf_plan ·
  *   lf_progress · lf_checkins · lf_consents · lf_photos · lf_pro ·
  *   lf_coach_threads
+ *
+ * M2: auth state (signed-in/out) mirrors the supabase-js session — nothing
+ * auth-related is persisted beyond that session. The consent-gated sync
+ * engine (lib/sync.ts, keys lf_outbox / lf_sync_meta) is notified from the
+ * mutating actions below; applying remote winners never re-triggers pushes.
  */
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { BACKEND_ENABLED } from '@/lib/config';
+import { onAuthStateChange, signOutBackend } from '@/lib/supabase';
+import {
+  clearSyncLocalState,
+  initialSync,
+  pushCaptureMeta,
+  pushCheckIn,
+  pushCoachThread,
+  pushConsents,
+  pushInventory,
+  pushPlan,
+  pushProfile,
+  pushSafety,
+  pushSessionLog,
+  registerSyncApplier,
+  removeCaptureMeta,
+  setSyncUser,
+  startSyncEngine,
+  syncNow,
+  type SyncedSnapshot,
+} from '@/lib/sync';
 import {
   evaluateSafety,
   conservativeSafetyEvaluation,
@@ -52,8 +78,19 @@ export interface Consents {
   photoSave: boolean;
   analytics: boolean;
   coachChat: boolean;
+  /** M2: gates ALL server writes (sync/upload). Off = fully local, like M1. */
+  sync: boolean;
 }
 export type ConsentKey = keyof Consents;
+
+/** M2 auth state — mirrors the supabase-js session, nothing persisted. */
+export interface AuthState {
+  status: 'signed-out' | 'signed-in';
+  userId?: string;
+  email?: string;
+  /** Live Supabase access token for edge-function calls (billing/entitlements). Never persisted. */
+  accessToken?: string;
+}
 
 /** Quality metadata for a capture — never appearance analysis (§8.6). */
 export interface CaptureQuality {
@@ -168,6 +205,8 @@ export interface AppContextValue {
   photos: Capture[];
   pro: ProState;
   coachThreads: CoachThread[];
+  /** M2: auth state (supabase session mirror) */
+  auth: AuthState;
   /** derived: current safety evaluation (from stored answers + inventory; conservative when skipped) */
   safetyEval: SafetyEvaluation;
   /** derived: current program day (first incomplete of 1–28) */
@@ -206,6 +245,12 @@ export interface AppContextValue {
   deletePhoto: (captureId: string) => void;
   /** upsert a local coach preview thread */
   saveCoachThread: (thread: CoachThread) => void;
+  /** M2: set auth state (used by the session listener in AppProvider / tests) */
+  setAuth: (next: AuthState) => void;
+  /** M2: end the Supabase session. Local data is kept, fully intact. */
+  signOut: () => Promise<void>;
+  /** M2 (sync engine → store): apply remote winners. Never triggers pushes. */
+  applySyncedSnapshot: (patch: SyncedSnapshot) => void;
   /** download all lf_* data as JSON */
   exportData: () => void;
   /** wipe every lf_* key and reload */
@@ -251,7 +296,7 @@ function save(key: string, value: unknown): void {
 
 /* ═══════════════════════════ Defaults ═════════════════════════════════ */
 
-const DEFAULT_CONSENTS: Consents = { cameraCoach: false, photoSave: false, analytics: false, coachChat: false };
+const DEFAULT_CONSENTS: Consents = { cameraCoach: false, photoSave: false, analytics: false, coachChat: false, sync: false };
 
 const DEFAULT_PROGRESS: ProgressState = {
   completedDays: [],
@@ -322,10 +367,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [plan, setPlan] = useState<Plan | null>(() => load(K.plan, null));
   const [progress, setProgress] = useState<ProgressState>(() => load(K.progress, DEFAULT_PROGRESS));
   const [checkIns, setCheckIns] = useState<CheckInRecord[]>(() => load(K.checkins, []));
-  const [consents, setConsents] = useState<Consents>(() => load(K.consents, DEFAULT_CONSENTS));
+  const [consents, setConsents] = useState<Consents>(() => ({ ...DEFAULT_CONSENTS, ...load(K.consents, DEFAULT_CONSENTS) }));
   const [photos, setPhotos] = useState<Capture[]>(() => load(K.photos, []));
   const [pro, setProState] = useState<ProState>(() => load(K.pro, DEFAULT_PRO));
   const [coachThreads, setCoachThreads] = useState<CoachThread[]>(() => load(K.coachThreads, []));
+  const [auth, setAuthState] = useState<AuthState>({ status: 'signed-out' });
 
   /* ── persistence effects ── */
   useEffect(() => save(K.onboarded, onboarded), [onboarded]);
@@ -339,6 +385,38 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => save(K.photos, photos), [photos]);
   useEffect(() => save(K.pro, pro), [pro]);
   useEffect(() => save(K.coachThreads, coachThreads), [coachThreads]);
+
+  /* ── M2: session listener + sync engine bootstrap (degrades to noop offline) ── */
+  useEffect(() => {
+    if (!BACKEND_ENABLED) return;
+    startSyncEngine();
+    const unsubscribe = onAuthStateChange((event, session) => {
+      const user = session?.user ?? null;
+      setAuthState(user ? { status: 'signed-in', userId: user.id, email: user.email ?? undefined, accessToken: session?.access_token ?? undefined } : { status: 'signed-out' });
+      setSyncUser(user?.id ?? null);
+      if (user && (event === 'SIGNED_IN' || event === 'INITIAL_SESSION')) {
+        void initialSync(user.id);
+      }
+    });
+    return unsubscribe;
+  }, []);
+
+  /* ── M2: sync engine applies remote winners through this callback ── */
+  const applySyncedSnapshot = useCallback((patch: SyncedSnapshot) => {
+    if (patch.profile) setProfileState(patch.profile);
+    if (patch.safety) setSafety(patch.safety);
+    if (patch.inventory) setInventoryState(patch.inventory);
+    if (patch.plan) setPlan(patch.plan);
+    if (patch.consents) setConsents(patch.consents);
+    if (patch.coachThreads) setCoachThreads(patch.coachThreads);
+    if (patch.checkIns) setCheckIns(patch.checkIns);
+    if (patch.comfortLog) setProgress((prev) => ({ ...prev, comfortLog: patch.comfortLog! }));
+  }, []);
+
+  useEffect(() => {
+    registerSyncApplier(applySyncedSnapshot);
+    return () => registerSyncApplier(null);
+  }, [applySyncedSnapshot]);
 
   /* ── derived ── */
   const safetyEval = useMemo<SafetyEvaluation>(() => {
@@ -355,44 +433,61 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const completeOnboarding = useCallback((data: OnboardingResult) => {
     const evalResult = evaluateSafety(data.safetyAnswers, data.inventory);
     const newPlan = buildPlan(data.profile, evalResult, data.inventory);
-    setProfileState(data.profile);
-    setSafety({
+    const safetyRecord: SafetyRecord = {
       answers: data.safetyAnswers,
       contraindicationCodes: evalResult.contraindicationCodes,
       ruleVersion: RULE_VERSION,
       reviewStatus: 'complete',
-    });
+    };
+    const nextConsents: Consents = { ...DEFAULT_CONSENTS, ...load(K.consents, {}), ...data.consents };
+    setProfileState(data.profile);
+    setSafety(safetyRecord);
     setInventoryState(data.inventory);
-    if (data.consents) setConsents((c) => ({ ...c, ...data.consents }));
+    if (data.consents) setConsents(nextConsents);
     setPlan(newPlan);
     setOnboarded(true);
+    /* M2: notify sync (no-op unless signed in + sync consent) */
+    pushProfile(data.profile);
+    pushSafety(safetyRecord);
+    pushInventory(data.inventory);
+    pushPlan(newPlan);
+    if (data.consents) pushConsents(nextConsents);
   }, []);
 
   const skipOnboarding = useCallback(() => {
     const p = DEFAULT_PROFILE;
     const evalResult = conservativeSafetyEvaluation();
-    setProfileState(p);
-    setSafety({
+    const safetyRecord: SafetyRecord = {
       answers: { ...EMPTY_SAFETY_ANSWERS },
       contraindicationCodes: [],
       ruleVersion: RULE_VERSION,
       reviewStatus: 'skipped',
-    });
+    };
+    const newPlan = buildPlan(p, evalResult, EMPTY_INVENTORY);
+    setProfileState(p);
+    setSafety(safetyRecord);
     setInventoryState(EMPTY_INVENTORY);
-    setPlan(buildPlan(p, evalResult, EMPTY_INVENTORY));
+    setPlan(newPlan);
     setOnboarded(true);
+    pushProfile(p);
+    pushSafety(safetyRecord);
+    pushInventory(EMPTY_INVENTORY);
+    pushPlan(newPlan);
   }, []);
 
   const setProfile = useCallback(
     (patch: Partial<UserProfile>) => {
       const next = { ...(profile ?? DEFAULT_PROFILE), ...patch };
       setProfileState(next);
+      pushProfile(next);
       if (plan && (patch.goals !== undefined || patch.routineTime !== undefined)) {
         const evalResult =
           safety && safety.reviewStatus === 'complete'
             ? evaluateSafety(safety.answers, inventory ?? EMPTY_INVENTORY)
             : conservativeSafetyEvaluation();
-        setPlan(buildPlan(next, evalResult, inventory ?? EMPTY_INVENTORY));
+        const newPlan = buildPlan(next, evalResult, inventory ?? EMPTY_INVENTORY);
+        setPlan(newPlan);
+        pushPlan(newPlan);
       }
     },
     [profile, plan, safety, inventory],
@@ -402,13 +497,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
     (answers: SafetyAnswers) => {
       const inv = inventory ?? EMPTY_INVENTORY;
       const evalResult = evaluateSafety(answers, inv);
-      setSafety({
+      const safetyRecord: SafetyRecord = {
         answers,
         contraindicationCodes: evalResult.contraindicationCodes,
         ruleVersion: RULE_VERSION,
         reviewStatus: 'complete',
-      });
-      if (profile) setPlan(buildPlan(profile, evalResult, inv));
+      };
+      setSafety(safetyRecord);
+      pushSafety(safetyRecord);
+      if (profile) {
+        const newPlan = buildPlan(profile, evalResult, inv);
+        setPlan(newPlan);
+        pushPlan(newPlan);
+      }
     },
     [inventory, profile],
   );
@@ -416,10 +517,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const setInventory = useCallback(
     (inv: Inventory) => {
       setInventoryState(inv);
+      pushInventory(inv);
       if (profile && safety?.reviewStatus === 'complete') {
         const evalResult = evaluateSafety(safety.answers, inv);
-        setPlan(buildPlan(profile, evalResult, inv));
-        setSafety((s) => (s ? { ...s, contraindicationCodes: evalResult.contraindicationCodes, ruleVersion: RULE_VERSION } : s));
+        const newPlan = buildPlan(profile, evalResult, inv);
+        setPlan(newPlan);
+        pushPlan(newPlan);
+        if (safety) {
+          const nextSafety: SafetyRecord = { ...safety, contraindicationCodes: evalResult.contraindicationCodes, ruleVersion: RULE_VERSION };
+          setSafety(nextSafety);
+          pushSafety(nextSafety);
+        }
       }
     },
     [profile, safety],
@@ -430,6 +538,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const logSession = useCallback(
     (activityId: string, comfortLevel: 1 | 2 | 3, seconds: number) => {
+      const entry: ComfortEntry = {
+        date: new Date().toISOString(),
+        activityId,
+        comfortLevel,
+        irritationFlag: comfortLevel === 3,
+        seconds,
+      };
+      pushSessionLog(entry);
       setProgress((prev) => {
         const today = todayKey();
         const firstToday = prev.lastDone !== today;
@@ -457,10 +573,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           lastDone: today,
           earlySessions: prev.earlySessions + (hour < 9 ? 1 : 0),
           dailyLog: { ...prev.dailyLog, [today]: nextLog },
-          comfortLog: [
-            ...prev.comfortLog,
-            { date: new Date().toISOString(), activityId, comfortLevel, irritationFlag: comfortLevel === 3, seconds },
-          ],
+          comfortLog: [...prev.comfortLog, entry],
           badges: { ...prev.badges },
         };
         for (const id of earnedBadges(next)) {
@@ -501,6 +614,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const basePlan = plan ?? buildPlan(profile ?? DEFAULT_PROFILE, evalResult, inventory ?? EMPTY_INVENTORY);
       const { plan: newPlan, diff } = adjustPlanAfterCheckIn(basePlan, input, evalResult);
       setPlan(newPlan);
+      pushPlan(newPlan);
       const record: CheckInRecord = {
         date: new Date().toISOString(),
         day: input.day,
@@ -511,14 +625,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
         planDiff: diff,
       };
       setCheckIns((prev) => [...prev, record]);
+      pushCheckIn(record);
       return diff;
     },
     [safety, inventory, plan, profile],
   );
 
-  const setConsent = useCallback((key: ConsentKey, value: boolean) => {
-    setConsents((prev) => ({ ...prev, [key]: value }));
-  }, []);
+  const setConsent = useCallback(
+    (key: ConsentKey, value: boolean) => {
+      const next: Consents = { ...consents, [key]: value };
+      save(K.consents, next); // synchronous — the sync consent gate reads localStorage
+      setConsents(next);
+      pushConsents(next);
+      if (key === 'sync' && value) void syncNow(); // opting in: full sync immediately
+    },
+    [consents],
+  );
 
   const addPhoto = useCallback((dataUrl: string, qualityMetrics?: CaptureQuality): Capture => {
     const capture: Capture = {
@@ -530,14 +652,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
       createdAt: new Date().toISOString(),
     };
     setPhotos((prev) => [...prev, capture]);
+    pushCaptureMeta(capture); // metadata only; gated on photoSave + sync inside sync.ts
     return capture;
   }, []);
 
   const deletePhoto = useCallback((captureId: string) => {
     setPhotos((prev) => prev.filter((p) => p.captureId !== captureId));
+    removeCaptureMeta(captureId);
   }, []);
 
   const saveCoachThread = useCallback((thread: CoachThread) => {
+    pushCoachThread(thread);
     setCoachThreads((prev) => {
       const i = prev.findIndex((t) => t.id === thread.id);
       if (i === -1) return [...prev, thread];
@@ -569,8 +694,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
     URL.revokeObjectURL(url);
   }, []);
 
+  const setAuth = useCallback((next: AuthState) => {
+    setAuthState(next);
+  }, []);
+
+  const signOut = useCallback(async () => {
+    await signOutBackend(); // clears the persisted supabase session; local lf_* data is kept
+    setSyncUser(null);
+    setAuthState({ status: 'signed-out' });
+  }, []);
+
   const deleteAllData = useCallback(() => {
     for (const key of ALL_KEYS) localStorage.removeItem(key);
+    clearSyncLocalState(); // lf_outbox + lf_sync_meta
     window.location.reload();
   }, []);
 
@@ -595,6 +731,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     photos,
     pro,
     coachThreads,
+    auth,
     safetyEval,
     currentDay,
     todayDoneIds,
@@ -613,6 +750,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     addPhoto,
     deletePhoto,
     saveCoachThread,
+    setAuth,
+    signOut,
+    applySyncedSnapshot,
     exportData,
     deleteAllData,
     isActivityLocked,
