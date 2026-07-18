@@ -13,7 +13,7 @@
  */
 
 import { createClient, type Session, type SupabaseClient, type User } from '@supabase/supabase-js';
-import { BACKEND_ENABLED, SUPABASE_PUBLISHABLE_KEY, SUPABASE_URL } from '@/lib/config';
+import { BACKEND_ENABLED, FUNCTIONS_BASE, SUPABASE_PUBLISHABLE_KEY, SUPABASE_URL } from '@/lib/config';
 
 let client: SupabaseClient | null = null;
 
@@ -88,6 +88,35 @@ export async function signOutBackend(): Promise<void> {
     await sb.auth.signOut();
   } catch (e) {
     console.warn('[LumaFace] sign-out failed', e);
+  }
+}
+
+/**
+ * Permanently delete the signed-in account via the `delete-account` Edge
+ * Function (service-side, cascades to every server row). Honest result:
+ * callers must not pretend the account is gone when this fails.
+ */
+export type DeleteAccountResult = { ok: true } | { ok: false; reason: 'unauthenticated' | 'offline' | 'server' };
+
+export async function deleteAccountPermanently(): Promise<DeleteAccountResult> {
+  const sb = getSupabase();
+  if (!sb) return { ok: false, reason: 'offline' };
+  const token = await getSessionToken();
+  if (!token) return { ok: false, reason: 'unauthenticated' };
+  try {
+    const res = await fetch(`${FUNCTIONS_BASE}delete-account`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        apikey: SUPABASE_PUBLISHABLE_KEY,
+      },
+    });
+    if (res.status === 401 || res.status === 403) return { ok: false, reason: 'unauthenticated' };
+    if (!res.ok) return { ok: false, reason: 'server' };
+    return { ok: true };
+  } catch {
+    return { ok: false, reason: 'offline' };
   }
 }
 

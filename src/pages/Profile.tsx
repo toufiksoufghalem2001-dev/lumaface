@@ -53,6 +53,7 @@ import {
 import { cn } from '@/lib/utils';
 import { useApp } from '@/lib/store';
 import { BACKEND_ENABLED } from '@/lib/config';
+import { deleteAccountPermanently } from '@/lib/supabase';
 import { deleteServerData, getSyncStatus, subscribeSyncStatus, syncNow, type SyncStatus } from '@/lib/sync';
 import { EMPTY_SAFETY_ANSWERS, type SafetyAnswers } from '@/lib/rules';
 import { EASE_OUT_SOFT, TIER_THEME } from '@/lib/theme';
@@ -543,12 +544,23 @@ export default function Profile() {
 
   /* ── destructive flows ── */
   async function confirmDeleteAll() {
-    /* M2: when signed in, also remove server-side rows (RLS-scoped per-table
-       delete; the auth user record itself remains — documented limitation). */
+    /* When signed in, permanently delete the account server-side first
+       (delete-account edge function cascades to every row). If that cannot
+       be completed we say so honestly — never pretend the account is gone. */
     if (signedIn) {
-      const res = await deleteServerData();
-      if (res.failed.length > 0) console.warn('[LumaFace] some server tables could not be cleared', res.failed);
-      await signOut();
+      const res = await deleteAccountPermanently();
+      if (res.ok) {
+        await signOut();
+      } else {
+        const res2 = await deleteServerData(); // best-effort row cleanup
+        if (res2.failed.length > 0) console.warn('[LumaFace] some server tables could not be cleared', res2.failed);
+        await signOut();
+        if (res.reason === 'offline') {
+          showToast('No connection — this device is wiped, but your account still exists. Delete it from any connection, or email care@lumaface.app.');
+        } else {
+          showToast('Your server data was cleared, but the sign-in record could not be removed — email care@lumaface.app to finish deletion.');
+        }
+      }
     }
     try {
       localStorage.removeItem(PREFS_KEY);
@@ -1174,7 +1186,7 @@ export default function Profile() {
         <p className="text-body text-ink-2 mt-2">
           Profile, plan, progress, photos, coach threads — all gone, unrecoverable.{' '}
           {signedIn
-            ? 'Your synced server data will be deleted too, and you will be signed out. (Your sign-in record itself remains on our systems — email care@lumaface.app to remove it.)'
+            ? 'Your account and all synced server data will be permanently deleted too, and you will be signed out.'
             : 'There is no copy anywhere else; your data only ever lived here.'}
         </p>
         <LFButton variant="secondary" className="mt-5" onClick={() => setSheet(null)}>
