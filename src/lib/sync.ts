@@ -12,16 +12,17 @@
  *  - Coach threads sync only when consents.coachChat AND consents.sync.
  *
  * Conflict model: per-entity last-write-wins using updated_at (singleton
- * tables, coach threads) and union-by-deterministic-id for append-only
- * tables (session_logs, check_ins, capture_meta). Deterministic ids make
- * pushes idempotent and round-trips duplicate-free.
+ * tables), message-level union for coach threads (both devices keep every
+ * message), and union-by-deterministic-id for append-only tables
+ * (session_logs, check_ins, capture_meta). Deterministic ids make pushes
+ * idempotent and round-trips duplicate-free.
  */
 
 import { BACKEND_ENABLED } from '@/lib/config';
 import { getSupabase } from '@/lib/supabase';
 import type { Plan, UserProfile } from '@/lib/plan';
 import { EMPTY_SAFETY_ANSWERS, type Inventory } from '@/lib/rules';
-import type { Capture, CheckInRecord, CoachThread, ComfortEntry, Consents, SafetyRecord } from '@/lib/store';
+import type { Capture, CheckInRecord, CoachThread, CoachThreadMessage, ComfortEntry, Consents, SafetyRecord } from '@/lib/store';
 
 /* ═══════════════════════ Keys & types ═════════════════════════════════ */
 
@@ -725,7 +726,7 @@ async function reconcile(userId: string, remote: PulledRows, local: LocalSnapsho
   mergeOne('plans', local.plan, remote.plans, rowToPlan, (d, ts) => planToRow(userId, d, ts), (d) => (patch.plan = d));
   mergeOne('consents', local.consents, remote.consents, rowToConsents, (d, ts) => consentsToRow(userId, d, ts), (d) => (patch.consents = d));
 
-  /* ── coach threads: union by resolved id, per-thread LWW ── */
+  /* ── coach threads: union by resolved id, message-level merge ── */
   if (remote.coach_threads !== undefined) {
     const remoteById = new Map(remote.coach_threads.map((r) => [str(r.id) ?? '', r]));
     const merged: CoachThread[] = [];
@@ -741,14 +742,13 @@ async function reconcile(userId: string, remote: PulledRows, local: LocalSnapsho
       }
       seenRemote.add(rid);
       const localTs = meta.threads[t.id] ?? t.messages[t.messages.length - 1]?.createdAt ?? t.createdAt;
-      const outcome = mergeSingleton({ data: t, updatedAt: localTs }, { data: rowToThread(remoteRow), updatedAt: str(remoteRow.updated_at) });
-      if (outcome.winner === 'remote') {
-        merged.push({ ...t, messages: (remoteRow.messages as CoachThread['messages']) ?? t.messages });
-        applied = true;
-      } else {
-        merged.push(t);
-        toPush.push(threadToRow(userId, t, localTs));
-      }
+      /* Message-level union instead of per-thread LWW: when both devices
+         appended to the same thread, keep every message from both. */
+      const remoteMsgs = Array.isArray(remoteRow.messages) ? (remoteRow.messages as CoachThread['messages']) : [];
+      const unionMsgs = unionMessagesById(t.messages, remoteMsgs);
+      merged.push({ ...t, messages: unionMsgs });
+      if (unionMsgs.length > remoteMsgs.length) toPush.push(threadToRow(userId, { ...t, messages: unionMsgs }, localTs));
+      if (unionMsgs.length > t.messages.length) applied = true;
     }
     for (const [rid, remoteRow] of remoteById) {
       if (!seenRemote.has(rid)) {
@@ -814,6 +814,18 @@ async function reconcile(userId: string, remote: PulledRows, local: LocalSnapsho
   touchLastSynced();
   notifyStatus();
   return { applied, pushed };
+}
+
+/**
+ * Message-level union for coach threads. Messages are immutable + append-only
+ * with globally-unique ids, so two devices chatting in the SAME thread merge
+ * losslessly — the old per-thread LWW clobbered one side's messages.
+ */
+export function unionMessagesById(local: CoachThreadMessage[], remote: CoachThreadMessage[]): CoachThreadMessage[] {
+  const byId = new Map<string, CoachThreadMessage>();
+  for (const m of remote) byId.set(m.id, m);
+  for (const m of local) byId.set(m.id, m);
+  return [...byId.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
 /* ═══════════════════════ Public orchestration ═════════════════════════ */
@@ -897,7 +909,8 @@ export async function deleteServerData(): Promise<DeleteServerResult> {
   if (!sb) return { skipped: true, deleted: [], failed: [] };
   const deleted: string[] = [];
   const failed: string[] = [];
-  for (const table of USER_TABLES) {
+  /* coach_usage holds no synced entity but is user data — wipe it too. */
+  for (const table of [...USER_TABLES, 'coach_usage']) {
     try {
       const column = table === 'profiles' ? 'id' : 'user_id';
       const { error } = await sb.from(table).delete().eq(column, currentUserId);
