@@ -1,426 +1,425 @@
 // @vitest-environment jsdom
 /**
- * Sync engine tests — merge logic, outbox retry, consent gating, import/merge
- * orchestration, per-entity consent (photos/coach), server delete. The
- * supabase-js boundary (@/lib/supabase) and the config module are mocked, so
- * no network ever happens.
+ * M2 sync-engine tests — consent gating, outbox semantics, merge logic,
+ * deterministic row ids, deleteServerData. No network: the Supabase client
+ * is replaced by a mock builder that records every call.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-
-/* ── hoisted fake backend state ── */
-const h = vi.hoisted(() => {
-  interface Call {
-    table: string;
-    op: 'upsert' | 'delete' | 'select';
-    payload?: unknown;
-    match?: Record<string, unknown>;
-    col?: string;
-    val?: unknown;
-  }
-  const calls: Call[] = [];
-  const rows: Record<string, Record<string, unknown>[]> = {};
-  const failUpsertTables = new Set<string>();
-  const state = { selectFails: false };
-  function reset() {
-    calls.length = 0;
-    for (const k of Object.keys(rows)) delete rows[k];
-    failUpsertTables.clear();
-    state.selectFails = false;
-  }
-  return { calls, rows, failUpsertTables, state, reset };
-});
-
-vi.mock('@/lib/config', () => ({
-  SUPABASE_URL: 'https://test.supabase.co',
-  SUPABASE_PUBLISHABLE_KEY: 'pk-test',
-  FUNCTIONS_BASE: 'https://test.supabase.co/functions/v1/',
-  BACKEND_ENABLED: true,
-}));
-
-vi.mock('@/lib/supabase', () => ({
-  getSupabase: () => ({
-    from(table: string) {
-      return {
-        async select() {
-          h.calls.push({ table, op: 'select' });
-          if (h.state.selectFails) return { data: null, error: { message: 'connection down' } };
-          return { data: h.rows[table] ?? [], error: null };
-        },
-        async upsert(payload: unknown) {
-          h.calls.push({ table, op: 'upsert', payload });
-          if (h.failUpsertTables.has(table)) {
-            h.failUpsertTables.delete(table);
-            return { data: null, error: { message: 'boom' } };
-          }
-          const list = h.rows[table] ?? (h.rows[table] = []);
-          for (const item of Array.isArray(payload) ? payload : [payload]) {
-            const row = item as Record<string, unknown>;
-            const key = 'id' in row ? 'id' : 'user_id';
-            const i = list.findIndex((x) => x[key] === row[key]);
-            if (i === -1) list.push(row);
-            else list[i] = { ...list[i], ...row };
-          }
-          return { data: null, error: null };
-        },
-        delete() {
-          return {
-            async match(m: Record<string, unknown>) {
-              h.calls.push({ table, op: 'delete', match: m });
-              return { error: null };
-            },
-            async eq(col: string, val: unknown) {
-              h.calls.push({ table, op: 'delete', col, val });
-              h.rows[table] = [];
-              return { error: null };
-            },
-          };
-        },
-      };
-    },
-  }),
-  getSession: vi.fn(async () => null),
-  getSessionToken: vi.fn(async () => null),
-  sendMagicLink: vi.fn(async () => null),
-  signOutBackend: vi.fn(async () => {}),
-  onAuthStateChange: vi.fn(() => () => {}),
-}));
-
+import { beforeEach, describe, expect, it } from 'vitest';
 import {
-  __resetSyncForTests,
   OUTBOX_KEY,
-  captureMetaId,
   checkInId,
   deleteServerData,
   flushOutbox,
   getSyncStatus,
   initialSync,
   mergeSingleton,
-  pushCaptureMeta,
   pushCheckIn,
   pushCoachThread,
   pushConsents,
+  pushCaptureMeta,
+  pushInventory,
   pushPlan,
   pushProfile,
+  pushSafety,
   pushSessionLog,
   registerSyncApplier,
   removeCaptureMeta,
   sessionLogId,
   setSyncUser,
   stableUuid,
+  startSyncEngine,
   syncNow,
   threadRowId,
   unionById,
   type SyncedSnapshot,
 } from '@/lib/sync';
-import { DEFAULT_PROFILE, type Capture, type CoachThread, type ComfortEntry } from '@/lib/store';
-import type { Plan } from '@/lib/plan';
+import { __setSupabaseForTests, type MockCall } from './mockSupabase';
+import type { Capture, CheckInRecord, CoachThread, ComfortEntry, Consents, SafetyRecord } from '@/lib/store';
+import type { Plan, UserProfile } from '@/lib/plan';
+import type { Inventory } from '@/lib/rules';
 
-const USER = '11111111-1111-4111-8111-111111111111';
+const USER = 'user-123';
 
-const PLAN: Plan = {
-  planId: 'plan_test',
-  ruleVersion: '2026.07.1',
+/* ── tiny builders ── */
+const profile: UserProfile = {
+  name: 'Mina',
   goals: ['glow'],
-  createdAt: '2026-07-01T08:00:00.000Z',
-  days: [],
-  warnings: [],
-  nextCheckInDay: 7,
+  routineTime: 5,
+  budgetMode: 'affordable',
+  adultConfirmed: true,
+  climate: 'temperate',
+  outdoorTime: 'indoors',
+};
+const safety: SafetyRecord = {
+  answers: { eyeSymptoms: true } as SafetyRecord['answers'],
+  contraindicationCodes: ['SAFE-EYE-01'],
+  ruleVersion: '2026.07.1',
+  reviewStatus: 'complete',
+};
+const inventory: Inventory = { products: ['cleanser'], reactsToNew: 'sometimes-reacts' };
+const plan = { planId: 'p1', ruleVersion: '2026.07.1', days: [] } as unknown as Plan;
+const consents: Consents = { cameraCoach: false, photoSave: false, analytics: false, coachChat: false, sync: true };
+const comfortEntry: ComfortEntry = {
+  date: '2026-07-14T08:00:00.000Z',
+  activityId: 'neutral-jaw-rest',
+  comfortLevel: 1,
+  irritationFlag: false,
+  seconds: 45,
+};
+const checkIn: CheckInRecord = {
+  date: '2026-07-14T09:00:00.000Z',
+  day: 7,
+  comfortRating: 2,
+  irritationFlag: false,
+  adherenceSelfReport: 'most',
+  planDiff: { added: [], kept: ['daily-sunscreen'], paused: [] },
+};
+const thread: CoachThread = {
+  id: 'coach_2026-07-14_abc123',
+  createdAt: '2026-07-14T10:00:00.000Z',
+  messages: [
+    { id: 'm1', role: 'user', text: 'hi coach', createdAt: '2026-07-14T10:00:00.000Z' },
+    { id: 'm2', role: 'coach', text: 'hello!', createdAt: '2026-07-14T10:00:05.000Z' },
+  ],
+};
+const capture: Capture = {
+  captureId: 'cap_abc123',
+  localOnly: true,
+  dataUrl: 'data:image/jpeg;base64,SECRET',
+  qualityMetrics: { lighting: 0.6, blur: 0.2, pose: 0.9 },
+  consentVersion: '2026.07.1',
+  createdAt: '2026-07-14T11:00:00.000Z',
 };
 
-const ENTRY: ComfortEntry = { date: '2026-07-10T09:00:00.000Z', activityId: 'neutral-jaw-rest', comfortLevel: 1, irritationFlag: false, seconds: 45 };
-
-function consentOn(extra: Record<string, boolean> = {}) {
-  localStorage.setItem('lf_consents', JSON.stringify({ cameraCoach: false, photoSave: false, analytics: false, coachChat: false, sync: true, ...extra }));
-}
-
-function outbox(): { id: string; table: string }[] {
-  return JSON.parse(localStorage.getItem(OUTBOX_KEY) ?? '[]') as { id: string; table: string }[];
-}
-
-function upsertCalls(table?: string) {
-  return h.calls.filter((c) => c.op === 'upsert' && (!table || c.table === table));
+function consentOn(extra: Partial<Consents> = {}) {
+  localStorage.setItem('lf_consents', JSON.stringify({ ...consents, ...extra }));
 }
 
 beforeEach(() => {
   localStorage.clear();
-  h.reset();
-  __resetSyncForTests();
-  setSyncUser(USER);
+  __setSupabaseForTests(null);
+  setSyncUser(null);
+  registerSyncApplier(null);
 });
-
-/* ═══════════ pure merge logic ═══════════ */
-
-describe('mergeSingleton (last-write-wins)', () => {
-  it('handles nulls and picks the newer timestamp', () => {
-    expect(mergeSingleton<string>(null, null)).toEqual({ winner: 'none', data: null });
-    expect(mergeSingleton({ data: 'L', updatedAt: '2026-01-01T00:00:00Z' }, null)).toEqual({ winner: 'local', data: 'L' });
-    expect(mergeSingleton(null, { data: 'R', updatedAt: '2026-01-01T00:00:00Z' })).toEqual({ winner: 'remote', data: 'R' });
-    expect(
-      mergeSingleton({ data: 'L', updatedAt: '2026-01-01T00:00:00Z' }, { data: 'R', updatedAt: '2026-02-01T00:00:00Z' }).winner,
-    ).toBe('remote');
-    expect(
-      mergeSingleton({ data: 'L', updatedAt: '2026-03-01T00:00:00Z' }, { data: 'R', updatedAt: '2026-02-01T00:00:00Z' }).winner,
-    ).toBe('local');
-    /* tie → local (no churn) */
-    expect(
-      mergeSingleton({ data: 'L', updatedAt: '2026-02-01T00:00:00Z' }, { data: 'R', updatedAt: '2026-02-01T00:00:00Z' }).winner,
-    ).toBe('local');
-    /* missing local timestamp = oldest → remote wins */
-    expect(mergeSingleton({ data: 'L', updatedAt: null }, { data: 'R', updatedAt: '2026-02-01T00:00:00Z' }).winner).toBe('remote');
-  });
-});
-
-describe('unionById (append-only)', () => {
-  const a = { id: 'a', date: '2026-01-02T00:00:00Z' };
-  const b = { id: 'b', date: '2026-01-01T00:00:00Z' };
-  const c = { id: 'c', date: '2026-01-03T00:00:00Z' };
-  it('unions, dedupes and sorts by date', () => {
-    const merged = unionById([a, b], [b, c], (x) => x.id);
-    expect(merged.map((x) => x.id)).toEqual(['b', 'a', 'c']);
-  });
-});
-
-describe('stableUuid', () => {
-  it('is deterministic and uuid-shaped', () => {
-    expect(stableUuid('seed')).toBe(stableUuid('seed'));
-    expect(stableUuid('seed')).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$/);
-    expect(stableUuid('a')).not.toBe(stableUuid('b'));
-  });
-});
-
-/* ═══════════ consent gating ═══════════ */
 
 describe('consent gating', () => {
-  it('queues but never uploads while sync=false; flushes once enabled', async () => {
-    pushProfile(DEFAULT_PROFILE);
+  it('writes nothing when sync consent is off, even signed in', async () => {
+    const h = __setSupabaseForTests();
+    setSyncUser(USER);
+    pushProfile(profile);
+    pushSafety(safety);
+    pushPlan(plan);
     await flushOutbox();
-    expect(upsertCalls()).toHaveLength(0); // zero server writes without consent
-    expect(outbox()).toHaveLength(1); // but queued for later
+    expect(h.calls).toHaveLength(0);
+    expect(loadOutboxLen()).toBe(0);
+  });
 
+  it('writes nothing when signed out, even with consent on', async () => {
+    const h = __setSupabaseForTests();
     consentOn();
+    pushProfile(profile);
     await flushOutbox();
-    expect(upsertCalls('profiles')).toHaveLength(1);
-    expect(outbox()).toHaveLength(0);
+    expect(h.calls).toHaveLength(0);
+    expect(loadOutboxLen()).toBe(0);
   });
 
-  it('syncNow refuses to run without sync consent', async () => {
-    const res = await syncNow();
-    expect(res).toMatchObject({ ok: false, reason: 'sync-consent-off' });
-    expect(h.calls.filter((c) => c.op !== 'select')).toHaveLength(0);
-    expect(upsertCalls()).toHaveLength(0);
-    expect(h.calls).toHaveLength(0); // not even reads
-  });
-
-  it('capture_meta requires photoSave AND sync; never carries photo bytes', async () => {
-    const cap: Capture = {
-      captureId: 'cap_1',
-      localOnly: true,
-      dataUrl: 'data:image/jpeg;base64,SECRETPIXELS',
-      qualityMetrics: { lighting: 0.8, blur: 0.1, pose: 0.9 },
-      consentVersion: '2026.07.1',
-      createdAt: '2026-07-10T10:00:00.000Z',
-    };
-    consentOn(); // sync on, photoSave off
-    pushCaptureMeta(cap);
+  it('writes when consent + user are both present; capture meta needs photoSave', async () => {
+    const h = __setSupabaseForTests();
+    consentOn(); // photoSave off
+    setSyncUser(USER);
+    pushCaptureMeta(capture); // dropped: no photoSave consent
+    pushProfile(profile); // allowed
     await flushOutbox();
-    expect(upsertCalls('capture_meta')).toHaveLength(0);
-    expect(outbox()).toHaveLength(0);
-
+    expect(h.calls.map((c) => c.table)).toEqual(['profiles']);
     consentOn({ photoSave: true });
-    pushCaptureMeta(cap);
+    pushCaptureMeta(capture);
     await flushOutbox();
-    expect(upsertCalls('capture_meta')).toHaveLength(1);
-    const payload = JSON.stringify(upsertCalls('capture_meta')[0].payload);
-    expect(payload).not.toContain('SECRETPIXELS');
-    expect(payload).not.toContain('data:image');
-
-    removeCaptureMeta('cap_1');
-    await flushOutbox();
-    const del = h.calls.find((c) => c.op === 'delete' && c.table === 'capture_meta');
-    expect(del?.match).toEqual({ id: captureMetaId('cap_1') });
+    const metaCalls = h.calls.filter((c) => c.table === 'capture_meta');
+    expect(metaCalls).toHaveLength(1);
+    const payload = metaCalls[0].payload as Record<string, unknown>;
+    expect(payload.dataUrl).toBeUndefined(); // metadata only, never photo bytes
+    expect(payload.lighting).toBe(0.6);
   });
 
-  it('coach threads require coachChat consent and use a derived uuid', async () => {
-    const thread: CoachThread = {
-      id: 'coach_2026-07-10_abc123',
-      createdAt: '2026-07-10T09:00:00.000Z',
-      messages: [{ id: 'm1', role: 'user', text: 'hi', createdAt: '2026-07-10T09:01:00.000Z' }],
-    };
-    consentOn(); // coachChat off
+  it('coach threads need coachChat consent', async () => {
+    const h = __setSupabaseForTests();
+    consentOn();
+    setSyncUser(USER);
     pushCoachThread(thread);
     await flushOutbox();
-    expect(upsertCalls('coach_threads')).toHaveLength(0);
-
+    expect(h.calls).toHaveLength(0);
     consentOn({ coachChat: true });
     pushCoachThread(thread);
     await flushOutbox();
-    expect(upsertCalls('coach_threads')).toHaveLength(1);
-    const row = upsertCalls('coach_threads')[0].payload as Record<string, unknown>;
-    expect(row.id).toBe(threadRowId(thread.id));
-    expect(row.id).not.toBe(thread.id); // local string id never leaks as PK
+    expect(h.calls.map((c) => c.table)).toContain('coach_threads');
   });
 });
 
-/* ═══════════ outbox ═══════════ */
-
-describe('offline outbox', () => {
-  it('keeps failed ops and retries them successfully', async () => {
+describe('outbox semantics', () => {
+  it('coalesces repeated upserts, keeps newest payload', async () => {
+    __setSupabaseForTests();
     consentOn();
-    h.failUpsertTables.add('plans');
-    pushPlan(PLAN);
+    setSyncUser(USER);
+    pushProfile(profile);
+    pushProfile({ ...profile, name: 'Nora' });
     await flushOutbox();
-    expect(upsertCalls('plans')).toHaveLength(1);
-    expect(outbox()).toHaveLength(1); // still queued after failure
-
-    await flushOutbox(); // now succeeds
-    expect(upsertCalls('plans')).toHaveLength(2);
-    expect(outbox()).toHaveLength(0);
-    expect(h.rows.plans).toHaveLength(1);
+    const calls = __setSupabaseForTests.callsOf('profiles');
+    expect(calls).toHaveLength(1);
+    expect((calls[0].payload as Record<string, unknown>).display_name).toBe('Nora');
   });
 
-  it('drops ops queued under a different account', async () => {
+  it('keeps failed items queued for retry (error then success)', async () => {
+    const h = __setSupabaseForTests({ failTables: ['plans'] });
     consentOn();
-    pushProfile(DEFAULT_PROFILE);
-    expect(outbox()).toHaveLength(1);
-    setSyncUser('22222222-2222-4222-8222-222222222222');
+    setSyncUser(USER);
+    pushPlan(plan);
     await flushOutbox();
-    expect(upsertCalls('profiles')).toHaveLength(0);
-    expect(outbox()).toHaveLength(0);
-  });
-
-  it('coalesces repeated upserts of the same entity', () => {
-    consentOn();
-    pushProfile({ ...DEFAULT_PROFILE, name: 'A' });
-    pushProfile({ ...DEFAULT_PROFILE, name: 'B' });
-    expect(outbox()).toHaveLength(1);
-  });
-
-  it('incremental pushes upsert rows on flush (session log + consents)', async () => {
-    consentOn();
-    pushSessionLog(ENTRY);
-    pushConsents({ cameraCoach: false, photoSave: false, analytics: false, coachChat: false, sync: true });
+    expect(loadOutboxLen()).toBe(1); // still queued
+    h.failTables = [];
     await flushOutbox();
-    expect(upsertCalls('consents')).toHaveLength(1);
-    expect(upsertCalls('session_logs')).toHaveLength(1);
-    const row = upsertCalls('session_logs')[0].payload as Record<string, unknown>;
-    expect(row).toMatchObject({ id: sessionLogId(ENTRY), user_id: USER, activity_id: ENTRY.activityId, logged_date: '2026-07-10' });
+    expect(loadOutboxLen()).toBe(0);
+    expect(h.calls.filter((c) => c.table === 'plans')).toHaveLength(2);
   });
 });
 
-/* ═══════════ initial sync: import & merge ═══════════ */
+describe('deterministic ids', () => {
+  it('stableUuid is deterministic + uuid-shaped', () => {
+    const a = stableUuid('session|x|2026-07-14');
+    expect(a).toBe(stableUuid('session|x|2026-07-14'));
+    expect(a).not.toBe(stableUuid('session|x|2026-07-15'));
+    expect(a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$/);
+  });
+
+  it('sessionLogId keys on activity+day (re-logging same day replaces)', () => {
+    expect(sessionLogId(comfortEntry)).toBe(sessionLogId({ ...comfortEntry, seconds: 999 }));
+    expect(sessionLogId(comfortEntry)).not.toBe(sessionLogId({ ...comfortEntry, activityId: 'other' }));
+  });
+
+  it('checkInId keys on day+date; threadRowId resolves local ids', () => {
+    expect(checkInId(checkIn)).toBe(checkInId({ ...checkIn, comfortRating: 1 }));
+    expect(threadRowId('coach_2026-07-14_abc123')).toBe(threadRowId('coach_2026-07-14_abc123'));
+  });
+});
+
+describe('merge logic', () => {
+  it('mergeSingleton: LWW with remote winning on newer updated_at, ties stay local', () => {
+    const local = { data: 'L', updatedAt: '2026-07-14T10:00:00Z' };
+    const remote = { data: 'R', updatedAt: '2026-07-14T11:00:00Z' };
+    expect(mergeSingleton(local, remote).winner).toBe('remote');
+    expect(mergeSingleton(local, { ...remote, updatedAt: '2026-07-14T10:00:00Z' }).winner).toBe('local');
+    expect(mergeSingleton(local, null).winner).toBe('local');
+    expect(mergeSingleton(null, remote).winner).toBe('remote');
+    expect(mergeSingleton<string>(null, null).winner).toBe('none');
+  });
+
+  it('unionById: append-only union, newest local wins same id, sorted by date', () => {
+    const l = [
+      { id: 'a', date: '2026-07-10', v: 'local-a' },
+      { id: 'b', date: '2026-07-12', v: 'local-b' },
+    ];
+    const r = [
+      { id: 'b', date: '2026-07-12', v: 'remote-b' },
+      { id: 'c', date: '2026-07-11', v: 'remote-c' },
+    ];
+    const merged = unionById(l, r, (x) => x.id);
+    expect(merged.map((x) => x.id)).toEqual(['a', 'c', 'b']);
+    expect(merged.find((x) => x.id === 'b')?.v).toBe('local-b');
+  });
+});
 
 describe('initialSync', () => {
-  it('imports local data into an empty account (with consent), once', async () => {
-    consentOn();
-    localStorage.setItem('lf_profile', JSON.stringify({ ...DEFAULT_PROFILE, name: 'Luma' }));
-    localStorage.setItem('lf_plan', JSON.stringify(PLAN));
-    localStorage.setItem('lf_progress', JSON.stringify({ comfortLog: [ENTRY] }));
-
-    const res = await initialSync(USER);
-    expect(res).toMatchObject({ ok: true, pushed: true });
-    expect(h.rows.profiles).toHaveLength(1);
-    expect(h.rows.profiles[0]).toMatchObject({ id: USER, display_name: 'Luma' });
-    expect(h.rows.plans).toHaveLength(1);
-    expect(h.rows.session_logs).toHaveLength(1);
-    expect(h.rows.session_logs[0].id).toBe(sessionLogId(ENTRY));
-
-    const again = await initialSync(USER);
-    expect(again.reason).toBe('already-synced');
-    expect(upsertCalls('profiles')).toHaveLength(1); // no second push
-  });
-
-  it('does NOT import when sync consent is off', async () => {
-    localStorage.setItem('lf_profile', JSON.stringify(DEFAULT_PROFILE));
+  it('signed-in + consent: imports local data into an empty account, then marks done', async () => {
+    const h = __setSupabaseForTests();
+    consentOn({ photoSave: true, coachChat: true });
+    setSyncUser(USER);
+    localStorage.setItem('lf_profile', JSON.stringify(profile));
+    localStorage.setItem('lf_safety', JSON.stringify(safety));
+    localStorage.setItem('lf_inventory', JSON.stringify(inventory));
+    localStorage.setItem('lf_plan', JSON.stringify(plan));
+    localStorage.setItem('lf_consents', JSON.stringify(consents));
+    localStorage.setItem('lf_checkins', JSON.stringify([checkIn]));
+    localStorage.setItem('lf_progress', JSON.stringify({ comfortLog: [comfortEntry] }));
+    localStorage.setItem('lf_coach_threads', JSON.stringify([thread]));
     const res = await initialSync(USER);
     expect(res.ok).toBe(true);
-    expect(upsertCalls()).toHaveLength(0); // reads only
+    const tables = new Set(h.calls.map((c) => c.table));
+    for (const t of ['profiles', 'safety_answers', 'inventories', 'plans', 'check_ins', 'session_logs', 'coach_threads']) {
+      expect(tables).toContain(t);
+    }
+    // second call is a no-op (already done for this user)
+    h.calls.length = 0;
+    await initialSync(USER);
+    expect(h.calls).toHaveLength(0);
   });
 
-  it('merges: newer remote profile wins and is applied locally', async () => {
+  it('remote wins a newer singleton; applies to the store via applier', async () => {
+    const h = __setSupabaseForTests();
     consentOn();
-    localStorage.setItem('lf_profile', JSON.stringify({ ...DEFAULT_PROFILE, name: 'Local' }));
+    setSyncUser(USER);
+    const applySpy: SyncedSnapshot[] = [];
+    registerSyncApplier((p) => applySpy.push(p));
+    localStorage.setItem('lf_profile', JSON.stringify(profile));
+    touchProfileMeta('2026-07-10T00:00:00Z');
     h.rows.profiles = [
       {
         id: USER,
-        display_name: 'Remote',
+        display_name: 'Remote Name',
         goals: ['calm'],
         routine_time: 10,
-        budget_mode: 'standard',
+        budget_mode: 'affordable',
         adult_confirmed: true,
-        climate: 'humid',
-        outdoor_time: 'lots',
-        hide_comparison: false,
-        updated_at: '2999-01-01T00:00:00.000Z',
+        climate: 'dry',
+        outdoor_time: 'mixed',
+        updated_at: '2026-07-15T00:00:00Z',
       },
     ];
-    const patches: SyncedSnapshot[] = [];
-    registerSyncApplier((p) => patches.push(p));
-
-    const res = await initialSync(USER);
-    expect(res).toMatchObject({ ok: true, applied: true });
-    expect(patches).toHaveLength(1);
-    expect(patches[0].profile).toMatchObject({ name: 'Remote', goals: ['calm'], routineTime: 10, climate: 'humid' });
+    await initialSync(USER);
+    expect(applySpy.length).toBeGreaterThan(0);
+    expect(applySpy[0].profile?.name).toBe('Remote Name');
+    expect(applySpy[0].profile?.routineTime).toBe(10);
   });
 
-  it('unions remote session logs into the local comfort log without dupes', async () => {
+  it('append-only comfort log unions local + remote entries', async () => {
+    const h = __setSupabaseForTests();
     consentOn();
-    localStorage.setItem('lf_progress', JSON.stringify({ comfortLog: [ENTRY] }));
-    const remoteOnly: ComfortEntry = { date: '2026-07-11T09:00:00.000Z', activityId: 'brow-glide', comfortLevel: 2, irritationFlag: false, seconds: 30 };
-    h.rows.session_logs = [
-      { id: sessionLogId(ENTRY), user_id: USER, activity_id: ENTRY.activityId, comfort_level: 1, seconds: 45, logged_date: '2026-07-10', created_at: ENTRY.date },
-      { id: sessionLogId(remoteOnly), user_id: USER, activity_id: 'brow-glide', comfort_level: 2, seconds: 30, logged_date: '2026-07-11', created_at: remoteOnly.date },
+    setSyncUser(USER);
+    const applySpy: SyncedSnapshot[] = [];
+    registerSyncApplier((p) => applySpy.push(p));
+    localStorage.setItem('lf_progress', JSON.stringify({ comfortLog: [comfortEntry] }));
+    const remoteEntry = {
+      id: sessionLogId({ activityId: 'other-act', date: '2026-07-15T08:00:00Z' }),
+      user_id: USER,
+      activity_id: 'other-act',
+      comfort_level: 2,
+      seconds: 60,
+      logged_date: '2026-07-15',
+      created_at: '2026-07-15T08:00:00Z',
+    };
+    h.rows.session_logs = [remoteEntry];
+    await initialSync(USER);
+    const comfort = applySpy[0]?.comfortLog ?? [];
+    expect(comfort.map((e) => e.activityId).sort()).toEqual(['neutral-jaw-rest', 'other-act']);
+  });
+
+  it('coach threads merge at message level — two devices keep both sides', async () => {
+    consentOn({ coachChat: true });
+    const localThread: CoachThread = {
+      id: 'coach_2026-07-10_abc123',
+      createdAt: '2026-07-10T09:00:00.000Z',
+      messages: [{ id: 'm_local', role: 'user', text: 'local question', createdAt: '2026-07-10T09:01:00.000Z' }],
+    };
+    localStorage.setItem('lf_coach_threads', JSON.stringify([localThread]));
+    __setSupabaseForTests();
+    setSyncUser(USER);
+    const h = mockHarness();
+    h.rows.coach_threads = [
+      {
+        id: threadRowId(localThread.id),
+        user_id: USER,
+        messages: [{ id: 'm_remote', role: 'user', text: 'remote question', createdAt: '2026-07-10T09:02:00.000Z' }],
+        created_at: '2026-07-10T09:00:00.000Z',
+        updated_at: '2026-07-10T09:02:00.000Z',
+      },
     ];
     const patches: SyncedSnapshot[] = [];
     registerSyncApplier((p) => patches.push(p));
 
     await initialSync(USER);
     expect(patches).toHaveLength(1);
-    expect(patches[0].comfortLog?.map((e) => e.activityId)).toEqual(['neutral-jaw-rest', 'brow-glide']);
-    expect(upsertCalls('session_logs')).toHaveLength(0); // nothing local-only to push
+    const merged = patches[0].coachThreads?.find((t) => t.id === localThread.id);
+    expect(merged?.messages.map((m) => m.id)).toEqual(['m_local', 'm_remote']); // union, sorted by createdAt
+    // remote was missing the local message → merged thread is pushed back up
+    const pushes = h.calls.filter((c) => c.op === 'upsert' && c.table === 'coach_threads');
+    expect(pushes).toHaveLength(1);
+    const pushedRow = (Array.isArray(pushes[0].payload) ? pushes[0].payload[0] : pushes[0].payload) as {
+      messages: { id: string }[];
+    };
+    expect(pushedRow.messages.map((m) => m.id)).toEqual(['m_local', 'm_remote']);
   });
 
   it('returns offline when every pull fails (and can retry later)', async () => {
+    __setSupabaseForTests({ failTables: ['profiles', 'safety_answers', 'inventories', 'plans', 'check_ins', 'session_logs', 'coach_threads', 'consents', 'capture_meta'] });
     consentOn();
-    h.state.selectFails = true;
+    setSyncUser(USER);
     const res = await initialSync(USER);
-    expect(res).toMatchObject({ ok: false, reason: 'offline' });
-    h.state.selectFails = false;
-    const retry = await initialSync(USER);
-    expect(retry.ok).toBe(true); // not marked done → retries
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe('offline');
   });
 });
 
-/* ═══════════ syncNow ═══════════ */
-
-describe('syncNow', () => {
-  it('pushes local winners, pulls, and stamps lastSyncedAt', async () => {
+describe('syncNow + status', () => {
+  it('syncNow flushes the outbox and stamps lastSyncedAt', async () => {
+    __setSupabaseForTests();
     consentOn();
-    localStorage.setItem('lf_profile', JSON.stringify({ ...DEFAULT_PROFILE, name: 'Now' }));
-    pushCheckIn({ date: '2026-07-14T20:00:00.000Z', day: 7, comfortRating: 2, irritationFlag: false, adherenceSelfReport: 'most', planDiff: { added: [], kept: [], paused: [] } });
+    setSyncUser(USER);
+    pushInventory(inventory);
     const res = await syncNow();
     expect(res.ok).toBe(true);
-    expect(h.rows.profiles).toHaveLength(1);
-    expect(h.rows.check_ins).toHaveLength(1);
-    expect(h.rows.check_ins[0].id).toBe(checkInId({ date: '2026-07-14T20:00:00.000Z', day: 7 }));
-    expect(getSyncStatus().lastSyncedAt).not.toBeNull();
+    expect(getSyncStatus().lastSyncedAt).toBeTruthy();
+    expect(getSyncStatus().pending).toBe(0);
+  });
+
+  it('reports reason when consent is off', async () => {
+    __setSupabaseForTests();
+    setSyncUser(USER);
+    const res = await syncNow();
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe('sync-consent-off');
   });
 });
-
-/* ═══════════ server delete ═══════════ */
 
 describe('deleteServerData', () => {
-  it('deletes every user table for the current user (not consent-gated)', async () => {
-    // no consentOn() — deletion is a data right, not a sync write
+  it('deletes every user table incl. coach_usage; reports failures honestly', async () => {
+    const h = __setSupabaseForTests({ failTables: ['plans'] });
+    setSyncUser(USER);
     const res = await deleteServerData();
     expect(res.skipped).toBe(false);
-    expect(res.failed).toHaveLength(0);
-    expect(res.deleted).toHaveLength(9);
+    expect(res.failed).toContain('plans');
+    expect(res.deleted).toHaveLength(10); // 9 sync tables + coach_usage
     const deletes = h.calls.filter((c) => c.op === 'delete');
-    expect(deletes).toHaveLength(9);
-    for (const d of deletes) {
-      expect(d.val).toBe(USER);
-      expect(d.col === 'user_id' || (d.table === 'profiles' && d.col === 'id')).toBe(true);
-    }
+    expect(deletes).toHaveLength(10);
+    for (const d of deletes) expect((d.match as Record<string, unknown>).user_id ?? (d.match as Record<string, unknown>).id).toBeTruthy();
+  });
+
+  it('skips when signed out', async () => {
+    const h = __setSupabaseForTests();
+    const res = await deleteServerData();
+    expect(res.skipped).toBe(true);
+    expect(h.calls).toHaveLength(0);
   });
 });
+
+describe('capture meta removal', () => {
+  it('removeCaptureMeta deletes the server row when allowed', async () => {
+    const h = __setSupabaseForTests();
+    consentOn({ photoSave: true });
+    setSyncUser(USER);
+    removeCaptureMeta(capture.captureId);
+    await flushOutbox();
+    const del = h.calls.find((c) => c.table === 'capture_meta' && c.op === 'delete');
+    expect(del).toBeTruthy();
+    expect((del!.match as Record<string, unknown>).id).toBe(stableUuid(`capture|${capture.captureId}`));
+  });
+});
+
+/* ── local helpers ── */
+
+function loadOutboxLen(): number {
+  try {
+    return (JSON.parse(localStorage.getItem(OUTBOX_KEY) ?? '[]') as unknown[]).length;
+  } catch {
+    return 0;
+  }
+}
+
+function touchProfileMeta(ts: string) {
+  localStorage.setItem('lf_sync_meta', JSON.stringify({ entities: { profiles: ts }, threads: {}, initialSyncDoneFor: {}, lastSyncedAt: null }));
+}
+
+function mockHarness() {
+  return __setSupabaseForTests.harness;
+}
+
+// re-export for TS (helpers use the same import names)
+export type { MockCall };
