@@ -165,7 +165,8 @@ describe('Activity detail', () => {
   it('free activity: full education + tinted Begin CTA', async () => {
     renderApp(['/activity/neutral-jaw-rest']);
     expect((await screen.findAllByText('Neutral Jaw Rest')).length).toBeGreaterThan(0);
-    expect(screen.getByText(/Start guided session/)).toBeTruthy();
+    // CTA bar renders via FramePortal — one commit after the page itself
+    expect(await screen.findByText(/Start guided session/)).toBeTruthy();
     expect(screen.getByText('Nothing to skip for')).toBeTruthy();
     expect(screen.getByText(/not medical advice/i)).toBeTruthy();
   });

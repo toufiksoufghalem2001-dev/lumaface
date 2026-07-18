@@ -3,7 +3,7 @@
 - Coach is a labeled local-retrieval Preview; `coachChat` consent does not yet gate local thread persistence (data never leaves device; tighten in M2).
 - `lf_onboarding_draft` is outside store.ALL_KEYS (unreachable post-onboarding; harmless) — fold into delete-all sweep in M2.
 - Reduced-motion Profile toggle works at CSS layer; framer-motion follows OS pref only (wire into MotionConfig in M2).
-- Bundle is a single ~523 kB chunk (163 kB gzip) — route-level React.lazy in M2.
+- ~~Bundle is a single chunk~~ — resolved: route-level React.lazy + vendor splitting (react/motion/supabase); entry is now ~379 kB (115 kB gzip) with per-route chunks of 2–55 kB.
 - Reminder/sound/haptic prefs are stored but inert (need native shell).
 - Queue mode (multi-activity sessions) implemented in player but has no caller yet.
 - Old coach threads persist but aren't browsable UI-wise.
