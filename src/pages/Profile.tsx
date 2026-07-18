@@ -23,6 +23,7 @@ import {
   CircleDot,
   Clock,
   CloudSun,
+  CloudUpload,
   Download,
   Droplets,
   EyeOff,
@@ -31,8 +32,10 @@ import {
   FlaskConical,
   Info,
   LifeBuoy,
+  LogOut,
   Mail,
   Palette,
+  RefreshCw,
   RotateCcw,
   ScrollText,
   Share2,
@@ -49,6 +52,8 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useApp } from '@/lib/store';
+import { BACKEND_ENABLED } from '@/lib/config';
+import { deleteServerData, getSyncStatus, subscribeSyncStatus, syncNow, type SyncStatus } from '@/lib/sync';
 import { EMPTY_SAFETY_ANSWERS, type SafetyAnswers } from '@/lib/rules';
 import { EASE_OUT_SOFT, TIER_THEME } from '@/lib/theme';
 import { GOALS, SAFETY_QUESTIONS, INVENTORY_OPTIONS, REACT_HISTORY_OPTIONS, AI_DISCLOSURE } from '@/data/content';
@@ -373,7 +378,6 @@ type SheetId =
   | 'inventory'
   | 'reminder'
   | 'manage'
-  | 'signin'
   | 'export'
   | 'delete1'
   | 'delete2'
@@ -394,11 +398,13 @@ export default function Profile() {
     safety,
     inventory,
     currentDay,
+    auth,
     setProfile,
     setSafetyAnswers,
     setInventory,
     clearPro,
     setConsent,
+    signOut,
     exportData,
     deleteAllData,
   } = useApp();
@@ -415,6 +421,11 @@ export default function Profile() {
   const [editingName, setEditingName] = useState(false);
   const [nameInput, setNameInput] = useState('');
   const toastTimer = useRef<number | null>(null);
+
+  /* M2: live sync status (last-synced time, pending outbox count) */
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>(() => getSyncStatus());
+  const [syncBusy, setSyncBusy] = useState(false);
+  useEffect(() => subscribeSyncStatus(setSyncStatus), []);
 
   /* sheet-local working state */
   const [draftGoals, setDraftGoals] = useState<string[]>([]);
@@ -504,8 +515,41 @@ export default function Profile() {
     setDraftGoals((prev) => (prev.includes(id) ? prev.filter((g) => g !== id) : prev.length >= 3 ? prev : [...prev, id]));
   }
 
+  /* ── account & sync (M2) ── */
+  const signedIn = auth.status === 'signed-in';
+  const lastSyncedLabel = useMemo(() => {
+    if (!syncStatus.lastSyncedAt) return 'Never synced yet';
+    const d = new Date(syncStatus.lastSyncedAt);
+    return `Last synced ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} · ${d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
+  }, [syncStatus.lastSyncedAt]);
+
+  async function handleSyncNow() {
+    setSyncBusy(true);
+    try {
+      const res = await syncNow();
+      if (res.ok) showToast('Synced — your ritual is safely backed up.');
+      else if (res.reason === 'sync-consent-off') showToast('Turn on “Sync & back up my data” above first.');
+      else if (res.reason === 'offline') showToast('You seem offline — changes are queued and will sync later.');
+      else showToast('Could not sync right now — nothing was lost.');
+    } finally {
+      setSyncBusy(false);
+    }
+  }
+
+  async function handleSignOut() {
+    await signOut();
+    showToast('Signed out — everything stays on this device.');
+  }
+
   /* ── destructive flows ── */
-  function confirmDeleteAll() {
+  async function confirmDeleteAll() {
+    /* M2: when signed in, also remove server-side rows (RLS-scoped per-table
+       delete; the auth user record itself remains — documented limitation). */
+    if (signedIn) {
+      const res = await deleteServerData();
+      if (res.failed.length > 0) console.warn('[LumaFace] some server tables could not be cleared', res.failed);
+      await signOut();
+    }
     try {
       localStorage.removeItem(PREFS_KEY);
     } catch {
@@ -667,13 +711,69 @@ export default function Profile() {
 
           <div className="mt-3 flex items-start gap-2.5 border-t border-hairline pt-3.5">
             <UserRound size={15} className="mt-[1px] shrink-0 text-ink-3" aria-hidden="true" />
-            <p className="flex-1 text-caption text-ink-2">You're browsing as a guest — create an account to sync across devices.</p>
-            <button type="button" onClick={() => setSheet('signin')} className="shrink-0 text-label text-rose min-h-[36px]">
-              Sign in
-            </button>
+            {signedIn ? (
+              <p className="flex-1 truncate text-caption text-ink-2">
+                Signed in as <span className="font-bold text-ink">{auth.email ?? 'your account'}</span>
+              </p>
+            ) : (
+              <>
+                <p className="flex-1 text-caption text-ink-2">You're browsing as a guest — sign in to sync across devices.</p>
+                <button type="button" onClick={() => navigate('/auth')} className="shrink-0 text-label text-rose min-h-[36px]">
+                  Sign in
+                </button>
+              </>
+            )}
           </div>
         </Card>
       </motion.section>
+
+      {/* ── Section 1.5 — Account & sync (M2) ── */}
+      {BACKEND_ENABLED && (
+        <motion.section initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, delay: 0.04, ease: EASE }} className="px-5 mt-6">
+          <p className="text-eyebrow uppercase text-ink-2 mb-2">Account & sync</p>
+          <Card className="p-3.5">
+            {signedIn ? (
+              <>
+                <div className="flex min-h-[52px] items-center gap-3 py-2">
+                  <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-full bg-cream-2 text-ink-2" aria-hidden="true">
+                    <Mail size={17} strokeWidth={1.75} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-body font-bold text-ink">{auth.email ?? 'Signed in'}</span>
+                    <span className="block text-caption text-ink-2">{consents.sync ? lastSyncedLabel : 'Backup off — turn on sync below to enable it'}</span>
+                  </span>
+                </div>
+                <div className="mt-1 flex gap-2 border-t border-hairline pt-3">
+                  <LFButton variant="secondary" className="flex-1" disabled={syncBusy || !consents.sync} onClick={() => void handleSyncNow()}>
+                    <RefreshCw size={15} className={syncBusy ? 'animate-spin' : undefined} aria-hidden="true" />
+                    {syncBusy ? 'Syncing…' : 'Sync now'}
+                  </LFButton>
+                  <LFButton variant="ghost" className="flex-1 underline underline-offset-2" onClick={() => void handleSignOut()}>
+                    <LogOut size={15} aria-hidden="true" />
+                    Sign out
+                  </LFButton>
+                </div>
+                <p className="mt-2 text-caption text-ink-3">Signing out keeps every bit of local data on this device.</p>
+              </>
+            ) : (
+              <>
+                <div className="flex items-start gap-3 py-2">
+                  <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-full bg-cream-2 text-ink-2" aria-hidden="true">
+                    <CloudUpload size={17} strokeWidth={1.75} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-body font-bold text-ink">Sign in to sync & back up</span>
+                    <span className="block text-caption text-ink-2">Optional — everything works without an account. One magic link, no password.</span>
+                  </span>
+                </div>
+                <LFButton variant="secondary" className="mt-2" onClick={() => navigate('/auth')}>
+                  Sign in with email
+                </LFButton>
+              </>
+            )}
+          </Card>
+        </motion.section>
+      )}
 
       {/* ── Section 2 — Ritual settings ── */}
       <motion.section initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, delay: 0.08, ease: EASE }} className="px-5 mt-6">
@@ -708,6 +808,20 @@ export default function Profile() {
           <ConsentToggle consentKey="analytics" value={consents.analytics} onChange={(v) => setConsent('analytics', v)} onSaved={() => showToast('Saved — you can change this anytime.')} />
           <div className="border-t border-hairline" />
           <ConsentToggle consentKey="coachChat" value={consents.coachChat} onChange={(v) => setConsent('coachChat', v)} onSaved={() => showToast('Saved — you can change this anytime.')} />
+          {BACKEND_ENABLED && (
+            <>
+              <div className="border-t border-hairline" />
+              <ConsentToggle
+                consentKey="sync"
+                value={consents.sync}
+                onChange={(v) => {
+                  setConsent('sync', v);
+                  if (v && !signedIn) showToast('Saved — sign in above to start backing up.');
+                }}
+                onSaved={() => showToast('Saved — you can change this anytime.')}
+              />
+            </>
+          )}
           <div className="border-t border-hairline" />
           <ToggleRow
             icon={EyeOff}
@@ -1037,19 +1151,6 @@ export default function Profile() {
         <p className="text-caption text-ink-2 mt-3">In the store build, "Manage" opens your store subscription settings directly.</p>
       </Sheet>
 
-      {/* Sign in (simulated) */}
-      <Sheet open={sheet === 'signin'} onClose={() => setSheet(null)} ariaLabel="Sign in">
-        <SheetHeader eyebrow="Optional" title="Create your account" />
-        <p className="text-body text-ink-2 mt-2">Sync your ritual across devices. Your photos stay on each device regardless — they never travel.</p>
-        <div className="mt-4 flex flex-col gap-2">
-          {['Continue with Apple', 'Continue with Google', 'Continue with Email'].map((label) => (
-            <LFButton key={label} variant="secondary" onClick={() => showToast('Accounts arrive with the native build — your data stays on this device for now.')}>
-              {label}
-            </LFButton>
-          ))}
-        </div>
-      </Sheet>
-
       {/* Export my data */}
       <Sheet open={sheet === 'export'} onClose={() => setSheet(null)} ariaLabel="Export my data">
         <SheetHeader eyebrow="Your data, portable" title="Export everything" />
@@ -1069,8 +1170,13 @@ export default function Profile() {
 
       {/* Delete all — step 1: safe choice visually primary */}
       <Sheet open={sheet === 'delete1'} onClose={() => setSheet(null)} ariaLabel="Delete all my data — step 1 of 2">
-        <SheetHeader eyebrow="This is permanent" title="Delete everything on this device?" />
-        <p className="text-body text-ink-2 mt-2">Profile, plan, progress, photos, coach threads — all gone, unrecoverable. There is no copy anywhere else; your data only ever lived here.</p>
+        <SheetHeader eyebrow="This is permanent" title={signedIn ? 'Delete everything, everywhere?' : 'Delete everything on this device?'} />
+        <p className="text-body text-ink-2 mt-2">
+          Profile, plan, progress, photos, coach threads — all gone, unrecoverable.{' '}
+          {signedIn
+            ? 'Your synced server data will be deleted too, and you will be signed out. (Your sign-in record itself remains on our systems — email care@lumaface.app to remove it.)'
+            : 'There is no copy anywhere else; your data only ever lived here.'}
+        </p>
         <LFButton variant="secondary" className="mt-5" onClick={() => setSheet(null)}>
           Keep my data
         </LFButton>
@@ -1148,7 +1254,7 @@ export default function Profile() {
           Photos stay on your device. Live camera frames never leave your device. No account needed. No sale of personal data. No facial analysis for advertising or identity.
         </p>
         <p className="text-body text-ink-2 mt-3">
-          In this preview build everything — profile, plan, progress, photos, coach threads — is stored only in this device's local storage. Export it or erase it anytime from Profile → Privacy &amp; consent; both work fully offline. The full policy ships with the store release.
+          Everything — profile, plan, progress, photos, coach threads — is stored in this device's local storage. If you sign in and explicitly turn on “Sync &amp; back up my data”, the data listed there (never photos) is also backed up to your account, protected by row-level security. Export it or erase it anytime from Profile → Privacy &amp; consent; erasing removes server copies too. The full policy ships with the store release.
         </p>
       </Sheet>
 
