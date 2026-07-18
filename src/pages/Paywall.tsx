@@ -4,10 +4,17 @@
  * real savings vs monthly), Monthly $9.99 on the same screen — NO weekly
  * plan anywhere. Close is visible immediately (never delayed), billing
  * terms (price · interval · trial · post-trial · renewal) live in a sticky
- * block that never scrolls away at 390×844, restore purchase (simulated),
- * "Cancel anytime in Settings" on the paywall itself, no countdowns, no
- * fake testimonials, unaltered hero-still-life.png imagery only.
- * Demo build: purchase is simulated → setPro(planLabel) → success state.
+ * block that never scrolls away at 390×844, restore purchase, "Cancel
+ * anytime in Settings" on the paywall itself, no countdowns, no fake
+ * testimonials, unaltered hero-still-life.png imagery only.
+ *
+ * M2 three-mode billing (engineer B):
+ *   a) signed in + backend configured → real Stripe Checkout redirect
+ *      (create-checkout-session → window.location). Never a fake charge.
+ *   b) backend reachable, Stripe unconfigured (edge 500 "Server
+ *      misconfigured") → honest "payments opening soon" state.
+ *   c) signed out → M1 demo purchase (setPro) with the "Demo build" label
+ *      and a gentle sign-in note. Restore checks the server when signed in.
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -17,6 +24,15 @@ import { Check, Lock, PiggyBank, ShieldCheck, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useApp } from '@/lib/store';
 import { COLORS, EASE_OUT_SOFT } from '@/lib/theme';
+import { BACKEND_ENABLED } from '@/lib/config';
+import {
+  authFromApp,
+  fetchEntitlement,
+  mapServerPlanToLabel,
+  startCheckout,
+  type AuthSnapshot,
+  type PriceKey,
+} from '@/lib/billing';
 import Sheet from '@/components/Sheet';
 import PetalConfetti from '@/components/PetalConfetti';
 import { MarkPetal } from '@/components/illos';
@@ -25,9 +41,9 @@ const EASE = EASE_OUT_SOFT;
 
 type PlanId = 'annual' | 'monthly';
 
-const PLANS: Record<PlanId, { label: string; proLabel: string; cta: string }> = {
-  annual: { label: 'Annual', proLabel: 'Annual $49.99/yr', cta: 'Start 7-day free trial' },
-  monthly: { label: 'Monthly', proLabel: 'Monthly $9.99/mo', cta: 'Subscribe for $9.99/month' },
+const PLANS: Record<PlanId, { label: string; proLabel: string; cta: string; priceKey: PriceKey }> = {
+  annual: { label: 'Annual', proLabel: 'Annual $49.99/yr', cta: 'Start 7-day free trial', priceKey: 'yearly' },
+  monthly: { label: 'Monthly', proLabel: 'Monthly $9.99/mo', cta: 'Subscribe for $9.99/month', priceKey: 'monthly' },
 };
 
 const FEATURES: { text: string; note: string; tint: string; deep: string; expandable?: boolean }[] = [
@@ -40,11 +56,31 @@ const FEATURES: { text: string; note: string; tint: string; deep: string; expand
   { text: 'Climate, time & budget adaptation', note: 'your routine fits your real life', tint: '#EBF5F2', deep: '#33675C' },
 ];
 
-const TERMS_COPY =
-  'Annual: $49.99/year after a 7-day free trial; the trial converts to the annual plan unless canceled at least 24 hours before it ends. Monthly: $9.99/month, no trial. Subscriptions renew automatically at the stated price and interval until canceled — manage or cancel anytime in your store settings (linked from Profile). Refunds are routed through your store. In this demo build no real charge is ever made.';
+const TERMS_BASE =
+  'Annual: $49.99/year after a 7-day free trial; the trial converts to the annual plan unless canceled at least 24 hours before it ends. Monthly: $9.99/month, no trial. Subscriptions renew automatically at the stated price and interval until canceled — manage or cancel anytime in your store settings (linked from Profile).';
+
+const TERMS_COPY: Record<BillingMode, string> = {
+  demo: `${TERMS_BASE} Refunds are routed through your store. In this demo build no real charge is ever made.`,
+  live: `${TERMS_BASE} We honor refund requests made within 48 hours of purchase (see Support); after that, the payment platform's rules apply. Payments are processed securely by Stripe — you review the total before any charge.`,
+  soon: `${TERMS_BASE} Payments open soon — no charge is possible yet, and none is made.`,
+};
+
+const FINE_PRINT: Record<BillingMode, string> = {
+  demo: 'Payment is charged to your store account at confirmation of purchase. Subscriptions renew automatically at the stated price and interval unless canceled at least 24 hours before the period ends — manage or cancel anytime in your store settings. The 7-day trial converts to the annual plan at $49.99/year unless canceled. LumaFace is a cosmetic wellness and education app; it is not medical advice and provides no diagnosis.',
+  live: 'Payment is processed by Stripe and charged at confirmation of purchase. Subscriptions renew automatically at the stated price and interval unless canceled at least 24 hours before the period ends — manage or cancel anytime from your Stripe receipt link or via Support. The 7-day trial converts to the annual plan at $49.99/year unless canceled. LumaFace is a cosmetic wellness and education app; it is not medical advice and provides no diagnosis.',
+  soon: 'Payments open soon — nothing is charged today. When checkout opens: subscriptions renew automatically at the stated price and interval unless canceled at least 24 hours before the period ends. The 7-day trial converts to the annual plan at $49.99/year unless canceled. LumaFace is a cosmetic wellness and education app; it is not medical advice and provides no diagnosis.',
+};
+
+const FOOTER_LABEL: Record<BillingMode, string> = {
+  demo: 'Demo build — no real charge is made.',
+  live: 'Secure checkout by Stripe — review before any charge.',
+  soon: 'Payments open soon — nothing is charged today.',
+};
 
 const PRIVACY_SUMMARY =
   'Photos stay on your device. Live camera frames never leave your device. No account needed. No sale of personal data. No facial analysis for advertising or identity. Coach messages in this preview build are simulated locally and never leave your device.';
+
+type BillingMode = 'demo' | 'live' | 'soon';
 
 /** User "calmer animations" pref (set in Profile) — local mirror, OS pref wins via useReducedMotion. */
 function calmMotionPref(): boolean {
@@ -129,8 +165,16 @@ function PlanCard({
 
 /* ── Main page ─────────────────────────────────────────────────────────── */
 
-export default function Paywall() {
-  const { setPro } = useApp();
+export interface PaywallProps {
+  /** Test seam: override the auth snapshot until the store's auth slice lands. */
+  authOverride?: AuthSnapshot;
+  /** Redirect seam (tests / a future native shell); defaults to window.location.assign. */
+  checkoutRedirect?: (url: string) => void;
+}
+
+export default function Paywall({ authOverride, checkoutRedirect }: PaywallProps = {}) {
+  const app = useApp();
+  const { setPro } = app;
   const navigate = useNavigate();
   const location = useLocation();
   const [params] = useSearchParams();
@@ -143,6 +187,9 @@ export default function Paywall() {
 
   const [plan, setPlan] = useState<PlanId>('annual'); // Annual hero pre-selected
   const [stage, setStage] = useState<'offer' | 'processing' | 'success'>('offer');
+  const [successMode, setSuccessMode] = useState<'purchase' | 'restored'>('purchase');
+  const [paymentsSoon, setPaymentsSoon] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   const [privacyNoteOpen, setPrivacyNoteOpen] = useState(false);
   const [legalSheet, setLegalSheet] = useState<'terms' | 'privacy' | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -150,6 +197,12 @@ export default function Paywall() {
   const timers = useRef<number[]>([]);
 
   useEffect(() => () => timers.current.forEach((t) => window.clearTimeout(t)), []);
+
+  /* Three-mode billing: live (signed in + backend), soon (Stripe
+     unconfigured — discovered honestly), demo (signed out, M1 behavior). */
+  const auth = authOverride ?? authFromApp(app);
+  const liveBilling = BACKEND_ENABLED && auth.signedIn && Boolean(auth.token);
+  const mode: BillingMode = paymentsSoon ? 'soon' : liveBilling ? 'live' : 'demo';
 
   function later(fn: () => void, ms: number) {
     timers.current.push(window.setTimeout(fn, ms));
@@ -170,20 +223,59 @@ export default function Paywall() {
     }, 1400);
   }
 
-  function purchase() {
-    if (stage !== 'offer') return;
+  async function purchase() {
+    if (stage !== 'offer' || paymentsSoon) return;
+    const token = liveBilling ? auth.token : null;
+    if (!token) {
+      /* Demo mode — the M1 simulated purchase, honestly labeled. */
+      setStage('processing');
+      later(() => {
+        setPro(PLANS[plan].proLabel);
+        setSuccessMode('purchase');
+        setStage('success');
+      }, 1200);
+      return;
+    }
+    /* Live mode — real Stripe Checkout redirect. */
     setStage('processing');
-    later(() => {
-      setPro(PLANS[plan].proLabel);
-      setStage('success');
-    }, 1200);
+    const res = await startCheckout(PLANS[plan].priceKey, token);
+    if (res.ok) {
+      (checkoutRedirect ?? ((url: string) => window.location.assign(url)))(res.data.url);
+      return; // leaving for Stripe — keep the spinner
+    }
+    setStage('offer');
+    if (res.error.kind === 'misconfigured') setPaymentsSoon(true);
+    else if (res.error.kind === 'unauthenticated') showToast('Your session expired — sign in again to purchase.');
+    else if (res.error.kind === 'network') showToast('No connection — nothing was charged. Try again.');
+    else showToast('Checkout could not start — no charge was made. Please try again.');
   }
 
-  const finePrint = useMemo(
-    () =>
-      'Payment is charged to your store account at confirmation of purchase. Subscriptions renew automatically at the stated price and interval unless canceled at least 24 hours before the period ends — manage or cancel anytime in your store settings. The 7-day trial converts to the annual plan at $49.99/year unless canceled. LumaFace is a cosmetic wellness and education app; it is not medical advice and provides no diagnosis.',
-    [],
-  );
+  async function restore() {
+    const token = liveBilling ? auth.token : null;
+    if (!token) {
+      showToast('No store purchase found — this is a demo build');
+      return;
+    }
+    if (restoring) return;
+    setRestoring(true);
+    const res = await fetchEntitlement(token);
+    setRestoring(false);
+    if (res.ok && res.data.isPro) {
+      setPro(mapServerPlanToLabel(res.data.planLabel));
+      setSuccessMode('restored');
+      setStage('success');
+    } else if (res.ok) {
+      showToast('No active subscription found for this account.');
+    } else if (res.error.kind === 'misconfigured') {
+      setPaymentsSoon(true);
+    } else if (res.error.kind === 'unauthenticated') {
+      showToast('Sign in again to restore your purchase.');
+    } else {
+      showToast('Could not check your subscription — try again in a moment.');
+    }
+  }
+
+  const finePrint = useMemo(() => FINE_PRINT[mode], [mode]);
 
   return (
     <motion.div
@@ -218,7 +310,9 @@ export default function Paywall() {
             transition={{ duration: 0.5, delay: 0.4, ease: EASE }}
             className="font-display italic text-quote mt-2 text-[rgba(253,247,242,.8)]"
           >
-            Your whole ritual is open — begin whenever you're ready.
+            {successMode === 'restored'
+              ? 'Your subscription is restored — everything is open again.'
+              : "Your whole ritual is open — begin whenever you're ready."}
           </motion.p>
           <motion.button
             type="button"
@@ -348,7 +442,7 @@ export default function Paywall() {
               </span>
               <span aria-hidden="true">·</span>
               <span className="inline-flex items-center gap-1">
-                <Lock size={12} aria-hidden="true" /> Secure store payment
+                <Lock size={12} aria-hidden="true" /> {mode === 'demo' ? 'Secure store payment' : 'Secure Stripe payment'}
               </span>
             </motion.p>
           </div>
@@ -360,6 +454,22 @@ export default function Paywall() {
               <PlanCard id="monthly" selected={plan === 'monthly'} onSelect={setPlan} />
             </div>
 
+            {/* Honest "opening soon" notice (Stripe unconfigured server-side) */}
+            {mode === 'soon' && (
+              <motion.div
+                initial={{ opacity: 0, y: 12 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.4, ease: EASE }}
+                role="status"
+                className="mt-3 rounded-[16px] bg-[rgba(253,247,242,.12)] px-4 py-3 text-center"
+              >
+                <p className="text-label">Payments open soon</p>
+                <p className="mt-1 text-caption text-[rgba(253,247,242,.72)]">
+                  We’re finishing our secure checkout setup. Nothing is charged today — the free tier is fully yours meanwhile.
+                </p>
+              </motion.div>
+            )}
+
             {/* CTA */}
             <motion.button
               type="button"
@@ -368,15 +478,17 @@ export default function Paywall() {
               transition={{ duration: 0.5, delay: 0.45, ease: EASE }}
               whileTap={{ scale: 0.97 }}
               onClick={purchase}
-              disabled={stage === 'processing'}
-              className="mt-3 flex min-h-[54px] w-full items-center justify-center gap-2 rounded-full bg-white text-[16px] font-bold text-plum"
+              disabled={stage === 'processing' || mode === 'soon'}
+              className="mt-3 flex min-h-[54px] w-full items-center justify-center gap-2 rounded-full bg-white text-[16px] font-bold text-plum disabled:opacity-60"
               style={{ boxShadow: '0 14px 34px -10px rgba(0,0,0,.4)' }}
             >
               {stage === 'processing' ? (
                 <>
                   <span className="size-4 animate-spin rounded-full border-2 border-plum/30 border-t-plum" aria-hidden="true" />
-                  Preparing your trial…
+                  {mode === 'live' ? 'Opening secure checkout…' : 'Preparing your trial…'}
                 </>
+              ) : mode === 'soon' ? (
+                'Payments open soon'
               ) : (
                 PLANS[plan].cta
               )}
@@ -408,8 +520,8 @@ export default function Paywall() {
 
             {/* Footer links */}
             <div className="mt-2.5 flex items-center justify-center gap-5">
-              <button type="button" onClick={() => showToast('No store purchase found — this is a demo build')} className="text-caption text-[rgba(253,247,242,.55)] underline underline-offset-2 min-h-[32px]">
-                Restore purchase
+              <button type="button" onClick={restore} disabled={restoring} className="text-caption text-[rgba(253,247,242,.55)] underline underline-offset-2 min-h-[32px] disabled:opacity-60">
+                {restoring ? 'Checking…' : 'Restore purchase'}
               </button>
               <button type="button" onClick={() => setLegalSheet('terms')} className="text-caption text-[rgba(253,247,242,.55)] underline underline-offset-2 min-h-[32px]">
                 Terms
@@ -418,7 +530,16 @@ export default function Paywall() {
                 Privacy
               </button>
             </div>
-            <p className="mt-1 text-center text-[10.5px] text-[rgba(253,247,242,.55)]">Demo build — no real charge is made.</p>
+            <p className="mt-1 text-center text-[10.5px] text-[rgba(253,247,242,.55)]">{FOOTER_LABEL[mode]}</p>
+            {mode === 'demo' && (
+              <p className="mt-1 text-center text-[10.5px] text-[rgba(253,247,242,.55)]">
+                Have an account?{' '}
+                <button type="button" onClick={() => navigate('/profile')} className="underline underline-offset-2">
+                  Sign in from Profile
+                </button>{' '}
+                to make it a real purchase.
+              </p>
+            )}
           </div>
         </>
       )}
@@ -443,7 +564,7 @@ export default function Paywall() {
       <Sheet open={legalSheet === 'terms'} onClose={() => setLegalSheet(null)} ariaLabel="Terms and subscription terms">
         <p className="text-eyebrow uppercase text-ink-2 mt-1">Plain and short</p>
         <h3 className="font-display text-display-md text-ink mt-1">Terms & subscription terms</h3>
-        <p className="text-body text-ink mt-3">{TERMS_COPY}</p>
+        <p className="text-body text-ink mt-3">{TERMS_COPY[mode]}</p>
       </Sheet>
       <Sheet open={legalSheet === 'privacy'} onClose={() => setLegalSheet(null)} ariaLabel="Privacy policy summary">
         <p className="text-eyebrow uppercase text-ink-2 mt-1">Your data, your rules</p>
