@@ -1,12 +1,17 @@
 /**
- * Coach — `/coach` (design/coach.md). The bounded AI coach, M1 "Preview":
- * every answer is simulated locally by the approved-library retrieval module
- * (./coach/engine.ts) and rendered through the exact §8.5 structured contract
- * via CoachBubble. Safety classifier intercepts BEFORE normal coaching:
+ * Coach — `/coach` (design/coach.md). The bounded AI coach.
+ * M1 "Preview": every answer is simulated locally by the approved-library
+ * retrieval module (./coach/engine.ts) and rendered through the exact §8.5
+ * structured contract via CoachBubble. M4 gateway: when signed in AND the
+ * coachChat consent is on, questions go to the `coach-chat` Edge Function
+ * (lib/coachGateway.ts) — real answers same contract; any hiccup falls back
+ * to the labeled local preview, and the honesty banner says which mode is
+ * active. Safety classifier intercepts BEFORE any coaching, both modes:
  * urgent symptoms → professional-care interrupt card + coaching paused;
  * diagnosis / attractiveness / other people / body-harm → graceful refusal.
- * Free tier: 3 questions/day (counted from today's thread messages); PRO is
- * unlimited. Threads persist locally via saveCoachThread.
+ * Free tier: 3 questions/day (counted from today's thread messages; the
+ * gateway also enforces it server-side); PRO is unlimited. Threads persist
+ * locally via saveCoachThread.
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -15,6 +20,8 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { ArrowUp, FlaskConical, Info, LifeBuoy, Sparkles } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useApp, todayKey, type CoachThread, type CoachThreadMessage } from '@/lib/store';
+import { BACKEND_ENABLED } from '@/lib/config';
+import { askCoachGateway } from '@/lib/coachGateway';
 import { EASE_OUT_SOFT } from '@/lib/theme';
 import { CoachBubble, CoachTyping, UserBubble } from '@/components/CoachBubble';
 import DisclaimerBlock from '@/components/DisclaimerBlock';
@@ -88,7 +95,7 @@ function SafetyInterruptCard({ body }: { body: string }) {
 /* ── Main page ─────────────────────────────────────────────────────────── */
 
 export default function Coach() {
-  const { profile, pro, coachThreads, saveCoachThread, setProfile } = useApp();
+  const { profile, pro, coachThreads, saveCoachThread, setProfile, auth, consents } = useApp();
   const navigate = useNavigate();
 
   /* Today's thread = the most recent thread started today (if any). */
@@ -146,6 +153,11 @@ export default function Coach() {
     saveCoachThread(next);
   }
 
+  /* M4: the live gateway is used only when signed in AND coachChat consent is
+     on (message content leaves the device only then). Every other case keeps
+     the labeled local preview — and any gateway hiccup falls back to it. */
+  const gatewayEnabled = BACKEND_ENABLED && auth.status === 'signed-in' && consents.coachChat;
+
   function send(raw: string) {
     const text = raw.trim();
     if (!text || typing || !canAsk || paused) return;
@@ -163,22 +175,47 @@ export default function Coach() {
       return;
     }
 
-    /* Normal flow: 1.1s typing indicator, then the reply. */
+    /* Normal flow: typing indicator, then the reply. */
     setTyping(true);
     commit(withUser);
-    typingTimer.current = window.setTimeout(() => {
+
+    const finish = (coachMsg: CoachThreadMessage) => {
       setTyping(false);
-      // non-urgent intercepts (urgent already returned above) → graceful refusal
-      const coachMsg = intercept
-        ? createMessage('coach', refusalText(intercept.kind))
-        : (() => {
-            const answer = answerQuestion(text, { goals: profile?.goals ?? [] });
-            return createMessage('coach', answer.summary, answer);
-          })();
       const cur = threadRef.current ?? withUser;
       commit({ ...cur, messages: [...cur.messages, coachMsg] });
       setChipOffset((n) => n + 1);
-    }, 1100);
+    };
+
+    const localAnswer = (): CoachThreadMessage => {
+      // non-urgent intercepts (urgent already returned above) → graceful refusal
+      if (intercept) return createMessage('coach', refusalText(intercept.kind));
+      const answer = answerQuestion(text, { goals: profile?.goals ?? [] });
+      return createMessage('coach', answer.summary, answer);
+    };
+
+    if (!gatewayEnabled || intercept) {
+      typingTimer.current = window.setTimeout(() => finish(localAnswer()), 1100);
+      return;
+    }
+
+    void (async () => {
+      const [res] = await Promise.all([
+        askCoachGateway(text),
+        new Promise((r) => window.setTimeout(r, 700)), // calm minimum, no jarring instant swaps
+      ]);
+      if (res.status === 'ok') {
+        finish(createMessage('coach', res.answer.summary, res.answer));
+      } else if (res.status === 'rate_limited') {
+        setTyping(false);
+        showToast('Today’s coach budget is used — back tomorrow, gently.');
+      } else if (res.status === 'no-consent' || res.status === 'unauthenticated') {
+        setTyping(false);
+        finish(localAnswer()); // session/consent changed mid-flow — preview keeps working
+      } else {
+        // unconfigured / unavailable / offline → honest fallback to the labeled preview
+        finish(localAnswer());
+      }
+    })();
   }
 
   function startNewConversation() {
@@ -215,7 +252,17 @@ export default function Coach() {
         >
           <FlaskConical size={16} className="shrink-0 mt-[1px] text-violet" aria-hidden="true" />
           <p className="text-caption text-ink">
-            <strong>Preview build</strong> — answers come from our approved library, not a live AI. The real coach will answer the same way: sources shown, uncertainty admitted, diagnosis never given.
+            {gatewayEnabled ? (
+              <>
+                <strong>Live coach (beta)</strong> — your question is answered by our safety-filtered service. Sources
+                shown, uncertainty admitted, diagnosis never given. Turn this off anytime in Profile → Your data.
+              </>
+            ) : (
+              <>
+                <strong>Preview build</strong> — answers come from our approved library, not a live AI. The real coach
+                will answer the same way: sources shown, uncertainty admitted, diagnosis never given.
+              </>
+            )}
           </p>
         </motion.div>
       </header>

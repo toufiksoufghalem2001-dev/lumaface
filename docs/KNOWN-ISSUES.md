@@ -20,3 +20,6 @@
 - Capture-quality thresholds (lighting/blur/framing) are conservative estimates — need real-device calibration on iPhone Safari/PWA + mid-range Android.
 - Camera permission-denial and interrupted-capture flows need real-device QA.
 - IndexedDB photo store needs native filesystem adaptation when packaging with Capacitor.
+
+## M4 additions
+- Coach gateway (`coach-chat` edge function + `coach_usage` table) is deployed and consent-gated; it returns `unconfigured` until AI_API_KEY/AI_MODEL/AI_BASE_URL secrets are set (CEO decision: provider). Until then the client keeps its labeled local preview — no faked AI.
